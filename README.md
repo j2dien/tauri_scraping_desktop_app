@@ -1,0 +1,1 @@
+# tauri_scraping_desktop_app
