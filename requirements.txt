@@ -1,0 +1,10 @@
+# Desktop App Requirements
+fastapi>=0.110.0
+uvicorn>=0.28.0
+pydantic>=2.0.0
+playwright>=1.40.0
+requests>=2.31.0
+instagrapi>=2.1.2
+openpyxl>=3.1.2
+pywebview>=5.0.0
+websockets>=12.0

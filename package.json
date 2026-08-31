@@ -1,0 +1,9 @@
+{
+  "name": "desktop-app",
+  "private": true,
+  "scripts": {
+    "desktop": "cd frontend && bun run desktop",
+    "dekstop": "cd frontend && bun run desktop",
+    "build": "cd frontend && bun run build"
+  }
+}
