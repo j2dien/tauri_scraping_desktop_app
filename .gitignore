@@ -23,6 +23,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.spec
 
 # Browser profile, caches & scraping data
 .tiktok_browser_profile/
@@ -38,9 +39,10 @@ frontend/dist/
 frontend/dist-ssr/
 frontend/*.local
 
-# Tauri / Rust build artifacts
+# Tauri / Rust build artifacts & sidecar resources
 frontend/src-tauri/target/
 frontend/src-tauri/gen/schemas
+frontend/src-tauri/resources/
 target/
 
 # Logs

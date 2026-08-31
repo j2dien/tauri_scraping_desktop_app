@@ -258,26 +258,51 @@ def auto_scrape_tiktok_profile_posts(
             pass
         return new_count
 
+    def _launch_browser_context(playwright_inst, is_headless: bool):
+        """Luncurkan browser context dengan fallback channel (msedge -> chrome -> chromium)."""
+        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ or os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "0":
+            local_app = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(local_app, "ms-playwright")
+
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+        ]
+        browser_viewport = {"width": 1280, "height": 900}
+        browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        channels = ["msedge", "chrome", None]
+        last_error = None
+
+        for ch in channels:
+            try:
+                launch_opts = {
+                    "user_data_dir": user_data_dir,
+                    "headless": is_headless,
+                    "args": browser_args,
+                    "viewport": browser_viewport,
+                    "locale": "id-ID",
+                    "user_agent": browser_ua,
+                }
+                if ch:
+                    launch_opts["channel"] = ch
+                ctx = playwright_inst.chromium.launch_persistent_context(**launch_opts)
+                ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                return ctx
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise TikTokScraperError(f"Gagal meluncurkan browser (Edge/Chrome/Chromium): {str(last_error)}")
+
     try:
         with sync_playwright() as p:
             # Percobaan 1: Headless persistent context
             if progress_callback:
                 progress_callback("Membuka browser Playwright...")
 
-            context = p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                ],
-                viewport={"width": 1280, "height": 900},
-                locale="id-ID",
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            )
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-
+            context = _launch_browser_context(p, is_headless=True)
             page = context.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=35000)
@@ -293,18 +318,7 @@ def auto_scrape_tiktok_profile_posts(
                     progress_callback("! Terdeteksi verifikasi puzzle TikTok -- Membuka browser visual...")
                 context.close()
 
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir,
-                    headless=False,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                    ],
-                    viewport={"width": 1280, "height": 900},
-                    locale="id-ID",
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                )
-                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                context = _launch_browser_context(p, is_headless=False)
                 page = context.new_page()
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=40000)

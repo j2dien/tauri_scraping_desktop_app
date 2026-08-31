@@ -13,9 +13,10 @@ dist
 dist-ssr
 *.local
 
-# Tauri / Rust build artifacts
+# Tauri / Rust build artifacts & sidecar resources
 src-tauri/target/
 src-tauri/gen/schemas
+src-tauri/resources/
 
 # Editor directories and files
 .vscode/*

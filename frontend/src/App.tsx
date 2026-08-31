@@ -293,9 +293,27 @@ export default function App(): React.JSX.Element {
     setProgressPercent(0);
     setAnalysisResult(null);
     setExportMessage('');
-    setStatusMessage('Menghubungkan ke scraping engine...');
+    setStatusMessage('Menghubungkan ke backend engine...');
 
     try {
+      // Tunggu hingga backend FastAPI siap (retry hingga 5 detik jika baru launching)
+      let isBackendReady = false;
+      for (let i = 0; i < 10; i++) {
+        try {
+          const check = await fetch(`${API_BASE}/api/health`, { method: 'GET' });
+          if (check.ok) {
+            isBackendReady = true;
+            break;
+          }
+        } catch {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+
+      if (!isBackendReady) {
+        throw new Error('Backend engine belum siap atau sedang memulai. Silakan coba lagi dalam beberapa detik.');
+      }
+
       const res = await fetch(`${API_BASE}/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
