@@ -4,6 +4,7 @@
   "scripts": {
     "desktop": "cd frontend && bun run desktop",
     "dekstop": "cd frontend && bun run desktop",
-    "build": "cd frontend && bun run build"
+    "build": "cd frontend && bun run build",
+    "build:desktop": "cd frontend && bun run tauri build"
   }
 }

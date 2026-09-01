@@ -104,15 +104,18 @@ export const IndonesianDatePicker: React.FC<IndonesianDatePickerProps> = ({ labe
           alignItems: 'center',
           textAlign: 'left',
           cursor: 'pointer',
-          padding: '10px 14px',
+          padding: '10px 12px',
           background: isOpen ? 'rgba(6, 182, 212, 0.12)' : 'rgba(0, 0, 0, 0.3)',
           borderColor: isOpen ? 'var(--accent-cyan)' : 'var(--border-color)',
+          gap: '8px',
+          whiteSpace: 'nowrap',
+          minWidth: 0,
         }}
       >
-        <span style={{ fontSize: '13px', fontWeight: '600', color: 'var(--text-primary)' }}>
+        <span style={{ fontSize: '13px', fontWeight: '600', color: value ? 'var(--text-primary)' : 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {displayFormatted()}
         </span>
-        <span style={{ fontSize: '15px', color: 'var(--accent-cyan)' }}>📅</span>
+        <span style={{ fontSize: '14px', color: 'var(--accent-cyan)', flexShrink: 0 }}>📅</span>
       </button>
 
       {/* Pop-up Indonesian Calendar Card */}

@@ -32,7 +32,7 @@ const safeJson = async (res: Response): Promise<Record<string, any>> => {
 
 export default function App(): React.JSX.Element {
   const [platform, setPlatform] = useState<Platform>('tiktok');
-  const [target, setTarget] = useState<string>('pusatlsskincare');
+  const [target, setTarget] = useState<string>('');
 
   // Date Helpers
   const MONTH_NAMES_ID = [
@@ -113,8 +113,8 @@ export default function App(): React.JSX.Element {
     return dateStr;
   };
 
-  const [startDate, setStartDate] = useState<string>('24-08-2026');
-  const [endDate, setEndDate] = useState<string>('30-08-2026');
+  const [startDate, setStartDate] = useState<string>('');
+  const [endDate, setEndDate] = useState<string>('');
   const [topN, setTopN] = useState<number>(10);
 
   // Instagram credentials
@@ -437,7 +437,7 @@ export default function App(): React.JSX.Element {
       </header>
 
       {/* Main Grid Layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: '24px', alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '420px 1fr', gap: '24px', alignItems: 'start' }}>
         
         {/* Left Column: Form Controls */}
         <div className="glass-panel" style={{ padding: '24px', position: 'relative', zIndex: 30 }}>
@@ -516,7 +516,7 @@ export default function App(): React.JSX.Element {
                 📅 Rentang Tanggal
               </label>
               <span style={{ fontSize: '11px', color: 'var(--accent-cyan)', fontWeight: '600' }}>
-                {formatIndoDate(startDate)} s/d {formatIndoDate(endDate)}
+                {startDate && endDate ? `${formatIndoDate(startDate)} s/d ${formatIndoDate(endDate)}` : startDate ? `Dari ${formatIndoDate(startDate)}` : endDate ? `Sampai ${formatIndoDate(endDate)}` : 'Semua / Belum Dipilih'}
               </span>
             </div>
 
