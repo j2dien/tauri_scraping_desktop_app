@@ -185,25 +185,60 @@ def auto_scrape_tiktok_profile_posts(
     clean_username = username.strip().lstrip("@")
     url = f"https://www.tiktok.com/@{clean_username}"
     
-    # Gunakan direktori .tiktok_browser_profile utama di workspace root
-    base_proj_dir = Path(__file__).resolve().parents[2] if len(Path(__file__).resolve().parents) > 2 else Path(__file__).resolve().parent
-    user_data_dir = str(base_proj_dir / ".tiktok_browser_profile")
+    # Gunakan direktori .tiktok_browser_profile utama di workspace root aplikasi
+    app_root_dir = Path(__file__).resolve().parent.parent
+    user_data_dir = str(app_root_dir / ".tiktok_browser_profile")
 
     posts_dict = {}
 
     def is_captcha_present(page) -> bool:
+        """Cek apakah puzzle captcha muncul di body utama, iframe, atau selector khusus."""
         try:
             cur_body = page.inner_text("body").lower()
             cur_html = page.content().lower()
-            return (
+            if (
                 "tarik penggeser" in cur_body
                 or "drag the slider" in cur_body
                 or "puzzle" in cur_body
                 or "fit the puzzle" in cur_body
                 or "secsdk-captcha" in cur_html
-            )
+                or "captcha_verify" in cur_html
+                or "verify-ele" in cur_html
+            ):
+                return True
+
+            # Cek selector elemen dan iframe yang sering dipakai TikTok captcha
+            captcha_selectors = [
+                'iframe[src*="captcha"]',
+                'iframe[id*="secsdk"]',
+                '#secsdk-captcha-drag-wrapper',
+                '.captcha_verify_container',
+                '.verify-wrap',
+                '#tiktok-verify-ele',
+                '.captcha-verify-image',
+                '.secsdk_captcha_modal',
+            ]
+            for sel in captcha_selectors:
+                try:
+                    if page.locator(sel).count() > 0:
+                        return True
+                except Exception:
+                    pass
+
+            # Periksa teks di dalam seluruh child iframe
+            for frame in page.frames:
+                try:
+                    frame_url = frame.url.lower()
+                    if "captcha" in frame_url or "secsdk" in frame_url or "verify" in frame_url:
+                        return True
+                    frame_text = frame.inner_text("body").lower()
+                    if "drag the slider" in frame_text or "tarik penggeser" in frame_text or "puzzle" in frame_text:
+                        return True
+                except Exception:
+                    pass
         except Exception:
-            return False
+            pass
+        return False
 
     def collect_from_page(page) -> int:
         new_count = 0
@@ -296,9 +331,59 @@ def auto_scrape_tiktok_profile_posts(
 
         raise TikTokScraperError(f"Gagal meluncurkan browser (Edge/Chrome/Chromium): {str(last_error)}")
 
+    def _switch_to_visual_and_solve_captcha(playwright_inst, current_ctx, target_url: str, progress_cb=None):
+        """Tutup context headless dan buka browser visual agar pengguna dapat menyelesaikan puzzle captcha."""
+        if progress_cb:
+            progress_cb("! Terdeteksi verifikasi puzzle TikTok -- Membuka browser visual...")
+
+        try:
+            current_ctx.close()
+        except Exception:
+            pass
+
+        # Beri jeda agar proses Chromium sebelumnya melepaskan file lock user_data_dir
+        time.sleep(1.5)
+
+        new_ctx = _launch_browser_context(playwright_inst, is_headless=False)
+        new_page = new_ctx.new_page()
+        try:
+            new_page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception:
+            pass
+
+        if progress_cb:
+            progress_cb("! Silakan geser puzzle slider pada jendela browser Chrome/Edge yang muncul...")
+
+        # Tunggu verifikasi diselesaikan pengguna (hingga 90 detik)
+        captcha_solved = False
+        for i in range(45):
+            time.sleep(2)
+            if not is_captcha_present(new_page):
+                captcha_solved = True
+                if progress_cb:
+                    progress_cb("✓ Puzzle captcha berhasil diselesaikan! Melanjutkan pengambilan postingan...")
+                # Berikan sedikit jeda untuk reload feed TikTok setelah puzzle selesai
+                time.sleep(2.5)
+                break
+            else:
+                if progress_cb and i % 3 == 0:
+                    remaining_secs = 90 - (i * 2)
+                    progress_cb(f"! Silakan geser puzzle slider di jendela browser ({remaining_secs}s tersisa)...")
+
+        if not captcha_solved:
+            try:
+                new_ctx.close()
+            except Exception:
+                pass
+            raise TikTokScraperError(
+                "Verifikasi puzzle captcha TikTok belum diselesaikan tepat waktu. "
+                "Silakan geser slider puzzle pada jendela browser yang terbuka, atau gunakan fitur Paste Link Video TikTok."
+            )
+
+        return new_ctx, new_page
+
     try:
         with sync_playwright() as p:
-            # Percobaan 1: Headless persistent context
             if progress_callback:
                 progress_callback("Membuka browser Playwright...")
 
@@ -309,41 +394,17 @@ def auto_scrape_tiktok_profile_posts(
             except Exception:
                 pass
 
-            time.sleep(3)
-            has_captcha = is_captcha_present(page)
+            # Polling hingga 6 detik di awal untuk mendeteksi apakah TikTok memicu puzzle captcha
+            has_captcha = False
+            for _ in range(3):
+                time.sleep(2)
+                if is_captcha_present(page):
+                    has_captcha = True
+                    break
 
-            # Jika terdeteksi puzzle captcha, buka browser visible agar user bisa menyelesaikan puzzle
+            # Jika terdeteksi puzzle captcha di awal, buka browser visible
             if has_captcha:
-                if progress_callback:
-                    progress_callback("! Terdeteksi verifikasi puzzle TikTok -- Membuka browser visual...")
-                context.close()
-
-                context = _launch_browser_context(p, is_headless=False)
-                page = context.new_page()
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=40000)
-                except Exception:
-                    pass
-
-                # Tunggu verifikasi diselesaikan (hingga 60 detik)
-                captcha_solved = False
-                for i in range(30):
-                    time.sleep(2)
-                    if not is_captcha_present(page):
-                        captcha_solved = True
-                        if progress_callback:
-                            progress_callback("✓ Puzzle captcha berhasil diselesaikan! Melanjutkan pengambilan postingan...")
-                        break
-                    else:
-                        if progress_callback and i % 3 == 0:
-                            progress_callback("! Silakan geser puzzle slider di jendela Chrome yang muncul...")
-
-                if not captcha_solved:
-                    context.close()
-                    raise TikTokScraperError(
-                        "Verifikasi puzzle captcha TikTok belum diselesaikan tepat waktu. "
-                        "Silakan geser slider puzzle pada jendela Chrome yang terbuka, atau gunakan fitur Paste Link Video TikTok."
-                    )
+                context, page = _switch_to_visual_and_solve_captcha(p, context, url, progress_callback)
 
             # Kumpulkan postingan awal
             collect_from_page(page)
@@ -370,14 +431,18 @@ def auto_scrape_tiktok_profile_posts(
                         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         time.sleep(2.0)
                         collect_from_page(page)
+                    elif no_new_count >= 4 and len(posts_dict) == 0:
+                        # Jika sama sekali tidak ada postingan, cek apakah captcha baru muncul di tengah scroll
+                        if is_captcha_present(page):
+                            # Alih-alih melempar error, segera buka browser visual untuk verifikasi!
+                            context, page = _switch_to_visual_and_solve_captcha(p, context, url, progress_callback)
+                            collect_from_page(page)
+                            no_new_count = 0
+                            continue
+                        elif no_new_count >= 6:
+                            break
                     elif no_new_count >= 5 and len(posts_dict) > 0:
                         # 5x scroll berturut-turut tanpa postingan baru -> akhir halaman profil
-                        break
-                    elif no_new_count >= 5 and len(posts_dict) == 0:
-                        # Jika sama sekali tidak ada postingan, cek apakah terhalang captcha
-                        if is_captcha_present(page):
-                            context.close()
-                            raise TikTokScraperError("TikTok memblokir permintaan dengan puzzle captcha. Silakan coba lagi dan selesaikan puzzle di browser visual.")
                         break
                 else:
                     no_new_count = 0

@@ -11,6 +11,21 @@ pub struct BackendProcess(pub Mutex<Option<Child>>);
 fn find_backend_executable(app: &tauri::App) -> Option<(PathBuf, PathBuf, bool)> {
   // Returns: (executable_path, working_dir, is_python_script)
 
+  // Prioritaskan script python server.py dalam mode development agar perubahan kode langsung aktif
+  #[cfg(debug_assertions)]
+  {
+    let mut current_py = std::env::current_dir().unwrap_or_default();
+    for _ in 0..5 {
+      let candidate_script = current_py.join("server.py");
+      if candidate_script.exists() {
+        return Some((PathBuf::from("python"), current_py.clone(), true));
+      }
+      if !current_py.pop() {
+        break;
+      }
+    }
+  }
+
   let mut candidate_paths: Vec<PathBuf> = Vec::new();
 
   // 1. Cek di Resource Directory Tauri (Production bundle / Installer)

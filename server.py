@@ -29,10 +29,12 @@ from pydantic import BaseModel
 
 from core.scraper_tiktok import get_tiktok_posts_in_range, get_all_tiktok_comments
 from core.scraper_instagram import (
-    create_client, login_instagram,
+    create_client, login_instagram, login_by_sessionid,
     get_posts_in_range as get_ig_posts_in_range,
     get_all_comments as get_ig_comments,
     LoginRequiredError as IGLoginRequiredError,
+    get_session_info as get_ig_session_info,
+    clear_session as clear_ig_session,
 )
 from core.analyzer import count_top_commenters, get_detailed_comments_by_user, get_summary_stats
 from core.exporter import export_to_excel
@@ -196,6 +198,11 @@ class AnalyzeRequest(BaseModel):
     top_n: int = 10
     ig_username: Optional[str] = None
     ig_password: Optional[str] = None
+    ig_session_id: Optional[str] = None
+
+
+class ClearSessionRequest(BaseModel):
+    username: str
 
 
 class ExportRequest(BaseModel):
@@ -276,28 +283,43 @@ async def run_analysis(req: AnalyzeRequest):
 
             elif req.platform.lower() == "instagram":
                 clean_target = req.target.replace("@", "").strip()
-                if not req.ig_username or not req.ig_password:
-                    sync_broadcast("error", "Instagram memerlukan username & password login akun.")
-                    return
+                cl = create_client()
 
                 def on_ig_login_log(msg: str):
                     sync_broadcast("status", msg)
                     sync_broadcast("log", msg)
 
-                sync_broadcast("status", f"Menghubungkan ke Instagram sebagai @{req.ig_username}...")
-                cl = create_client()
+                # 1. Login via Cookie Session ID jika disediakan
+                if req.ig_session_id and req.ig_session_id.strip():
+                    user_tag = req.ig_username.replace("@", "").strip() if req.ig_username else "session_user"
+                    sync_broadcast("status", "Menghubungkan ke Instagram via Cookie Session ID...")
+                    try:
+                        login_by_sessionid(cl, req.ig_session_id, username=user_tag, progress_callback=on_ig_login_log)
+                    except IGLoginRequiredError as le:
+                        sync_broadcast("error", str(le))
+                        return
+                    except Exception as e:
+                        sync_broadcast("error", f"Gagal login via Session ID: {str(e)}")
+                        return
 
-                try:
-                    logged_in = login_instagram(cl, req.ig_username, req.ig_password, progress_callback=on_ig_login_log)
-                except IGLoginRequiredError as le:
-                    sync_broadcast("error", str(le))
-                    return
-                except Exception as e:
-                    sync_broadcast("error", f"Gagal login Instagram: {str(e)}")
-                    return
+                # 2. Login via Username & Password
+                elif req.ig_username and req.ig_password:
+                    clean_user = req.ig_username.replace("@", "").strip()
+                    sync_broadcast("status", f"Menghubungkan ke Instagram sebagai @{clean_user}...")
+                    try:
+                        logged_in = login_instagram(cl, clean_user, req.ig_password, progress_callback=on_ig_login_log)
+                    except IGLoginRequiredError as le:
+                        sync_broadcast("error", str(le))
+                        return
+                    except Exception as e:
+                        sync_broadcast("error", f"Gagal login Instagram: {str(e)}")
+                        return
 
-                if not logged_in:
-                    sync_broadcast("error", "Login Instagram gagal. Periksa username dan password Anda.")
+                    if not logged_in:
+                        sync_broadcast("error", "Login Instagram gagal. Periksa username dan password Anda.")
+                        return
+                else:
+                    sync_broadcast("error", "Instagram memerlukan Username & Password ATAU Cookie Session ID untuk login.")
                     return
 
                 def on_ig_post_log(msg: Any):
@@ -425,6 +447,25 @@ def open_external_url(req: OpenUrlRequest):
         return {"status": "success", "url": url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membuka URL: {str(e)}")
+
+
+@app.get("/api/instagram/session-status")
+def check_ig_session_status(username: str):
+    """Cek apakah ada file sesi Instagram yang tersimpan untuk username ini."""
+    try:
+        return get_ig_session_info(username)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/instagram/clear-session")
+def clear_ig_session_endpoint(req: ClearSessionRequest):
+    """Hapus file sesi Instagram untuk username tertentu."""
+    try:
+        cleared = clear_ig_session(req.username)
+        return {"status": "success", "cleared": cleared, "message": f"Sesi untuk @{req.username} telah dihapus"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Mount frontend static distribution

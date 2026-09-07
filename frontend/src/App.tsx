@@ -117,9 +117,51 @@ export default function App(): React.JSX.Element {
   const [endDate, setEndDate] = useState<string>('');
   const [topN, setTopN] = useState<number>(10);
 
-  // Instagram credentials
+  // Instagram credentials & Session
+  const [igLoginMode, setIgLoginMode] = useState<'credentials' | 'sessionid'>('credentials');
   const [igUser, setIgUser] = useState<string>('');
   const [igPass, setIgPass] = useState<string>('');
+  const [igSessionId, setIgSessionId] = useState<string>('');
+  const [showCookieGuide, setShowCookieGuide] = useState<boolean>(false);
+  const [hasSavedSession, setHasSavedSession] = useState<boolean>(false);
+
+  // Cek apakah akun instagram memiliki sesi tersimpan
+  useEffect(() => {
+    if (!igUser || platform !== 'instagram') {
+      setHasSavedSession(false);
+      return;
+    }
+    const clean = igUser.replace('@', '').trim();
+    if (!clean) return;
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/instagram/session-status?username=${encodeURIComponent(clean)}`);
+        if (res.ok) {
+          const data = await safeJson(res);
+          setHasSavedSession(!!data.has_saved_session);
+        }
+      } catch {
+        // ignore
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [igUser, platform]);
+
+  const handleClearSession = async () => {
+    const clean = igUser.replace('@', '').trim();
+    if (!clean) return;
+    try {
+      await fetch(`${API_BASE}/api/instagram/clear-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: clean }),
+      });
+      setHasSavedSession(false);
+      setStatusMessage(`Sesi untuk @${clean} berhasil dihapus.`);
+    } catch (e: any) {
+      alert(`Gagal menghapus sesi: ${e.message}`);
+    }
+  };
 
   // Status & Live Logs
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -323,8 +365,9 @@ export default function App(): React.JSX.Element {
           start_date: startDate,
           end_date: endDate,
           top_n: Number(topN) || 10,
-          ig_username: igUser || null,
-          ig_password: igPass || null,
+          ig_username: igUser ? igUser.replace('@', '').trim() : null,
+          ig_password: igLoginMode === 'credentials' ? (igPass || null) : null,
+          ig_session_id: igLoginMode === 'sessionid' ? (igSessionId.trim() || null) : null,
         }),
       });
 
@@ -567,26 +610,129 @@ export default function App(): React.JSX.Element {
 
           {/* Instagram Login Credentials (if IG selected) */}
           {platform === 'instagram' && (
-            <div style={{ padding: '14px', borderRadius: '12px', background: 'rgba(236, 72, 153, 0.08)', border: '1px solid rgba(236, 72, 153, 0.2)', marginBottom: '20px' }}>
-              <span style={{ fontSize: '12px', color: 'var(--accent-pink)', fontWeight: '600', display: 'block', marginBottom: '8px' }}>
-                🔒 Login Instagram (Wajib Akun Sekunder)
-              </span>
-              <div style={{ display: 'grid', gap: '8px' }}>
-                <input
-                  type="text"
-                  className="custom-input"
-                  placeholder="Username Instagram Anda"
-                  value={igUser}
-                  onChange={(e) => setIgUser(e.target.value)}
-                />
-                <input
-                  type="password"
-                  className="custom-input"
-                  placeholder="Password Instagram Anda"
-                  value={igPass}
-                  onChange={(e) => setIgPass(e.target.value)}
-                />
+            <div style={{ padding: '16px', borderRadius: '14px', background: 'rgba(236, 72, 153, 0.08)', border: '1px solid rgba(236, 72, 153, 0.25)', marginBottom: '20px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                <span style={{ fontSize: '13px', color: 'var(--accent-pink)', fontWeight: '700', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  🔒 Autentikasi Instagram
+                </span>
+                {hasSavedSession && (
+                  <span style={{ fontSize: '11px', color: 'var(--accent-green)', background: 'rgba(16, 185, 129, 0.15)', padding: '2px 8px', borderRadius: '8px', fontWeight: '600' }}>
+                    ✓ Sesi Tersimpan
+                  </span>
+                )}
               </div>
+
+              {/* Mode Selector: Credentials vs Session ID */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', marginBottom: '12px' }}>
+                <button
+                  type="button"
+                  onClick={() => setIgLoginMode('credentials')}
+                  style={{
+                    padding: '7px 8px',
+                    borderRadius: '8px',
+                    border: igLoginMode === 'credentials' ? '1.5px solid var(--accent-pink)' : '1px solid rgba(255,255,255,0.1)',
+                    background: igLoginMode === 'credentials' ? 'rgba(236, 72, 153, 0.25)' : 'rgba(0,0,0,0.3)',
+                    color: 'var(--text-primary)',
+                    fontSize: '11px',
+                    fontWeight: '600',
+                    cursor: 'pointer',
+                  }}
+                >
+                  🔑 Password
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIgLoginMode('sessionid')}
+                  style={{
+                    padding: '7px 8px',
+                    borderRadius: '8px',
+                    border: igLoginMode === 'sessionid' ? '1.5px solid var(--accent-cyan)' : '1px solid rgba(255,255,255,0.1)',
+                    background: igLoginMode === 'sessionid' ? 'rgba(6, 182, 212, 0.25)' : 'rgba(0,0,0,0.3)',
+                    color: 'var(--text-primary)',
+                    fontSize: '11px',
+                    fontWeight: '600',
+                    cursor: 'pointer',
+                  }}
+                >
+                  🍪 Cookie Session ID
+                </button>
+              </div>
+
+              {igLoginMode === 'credentials' ? (
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  <input
+                    type="text"
+                    className="custom-input"
+                    placeholder="Username Instagram Anda (misal: zenfdn)"
+                    value={igUser}
+                    onChange={(e) => setIgUser(e.target.value)}
+                  />
+                  <input
+                    type="password"
+                    className="custom-input"
+                    placeholder="Password Instagram Anda"
+                    value={igPass}
+                    onChange={(e) => setIgPass(e.target.value)}
+                  />
+                  {hasSavedSession && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '2px' }}>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Identitas perangkat Anda telah disimpan.</span>
+                      <button
+                        type="button"
+                        onClick={handleClearSession}
+                        style={{ fontSize: '11px', color: '#f87171', background: 'transparent', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}
+                      >
+                        Hapus Sesi
+                      </button>
+                    </div>
+                  )}
+                  <span style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+                    📱 Jika muncul permintaan konfirmasi di HP, buka aplikasi Instagram, ketuk <b>'Ini Saya'</b>, lalu klik tombol 'Mulai Scraping' lagi.
+                  </span>
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  <input
+                    type="text"
+                    className="custom-input"
+                    placeholder="Username Akun Anda (opsional)"
+                    value={igUser}
+                    onChange={(e) => setIgUser(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className="custom-input"
+                    placeholder="Paste cookie sessionid di sini"
+                    value={igSessionId}
+                    onChange={(e) => setIgSessionId(e.target.value)}
+                    style={{ fontFamily: 'monospace', fontSize: '12px' }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '11px', color: 'var(--accent-cyan)', fontWeight: '600' }}>
+                      ⭐ Bebas Challenge / 2FA 100%
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowCookieGuide(!showCookieGuide)}
+                      style={{ fontSize: '11px', color: 'var(--text-secondary)', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', padding: '3px 8px', borderRadius: '6px', cursor: 'pointer' }}
+                    >
+                      {showCookieGuide ? 'Tutup Panduan' : '📖 Cara Ambil Cookie'}
+                    </button>
+                  </div>
+
+                  {showCookieGuide && (
+                    <div style={{ background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(6, 182, 212, 0.3)', borderRadius: '8px', padding: '10px 12px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.5' }}>
+                      <b style={{ color: 'var(--accent-cyan)' }}>Langkah mengambil cookie sessionid:</b>
+                      <ol style={{ paddingLeft: '16px', margin: '6px 0 0 0' }}>
+                        <li>Buka <b>instagram.com</b> di browser Chrome/Edge dan pastikan sudah login.</li>
+                        <li>Tekan <b>F12</b> (Inspect Element), buka tab <b>Application</b> (atau Storage).</li>
+                        <li>Di panel kiri, klik <b>Cookies</b> &gt; <b>https://www.instagram.com</b>.</li>
+                        <li>Cari nama <b>sessionid</b>, klik dua kali nilainya, copy, lalu paste di kotak di atas.</li>
+                      </ol>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -641,6 +787,57 @@ export default function App(): React.JSX.Element {
                   background: 'var(--gradient-primary)',
                   transition: 'width 0.3s ease'
                 }} />
+              </div>
+            )}
+
+            {/* Dynamic Interactive Guidance Banners */}
+            {(statusMessage.toLowerCase().includes('puzzle') || statusMessage.toLowerCase().includes('slider')) && (
+              <div style={{
+                background: 'rgba(6, 182, 212, 0.12)',
+                border: '1.5px solid var(--accent-cyan)',
+                borderRadius: '10px',
+                padding: '12px 16px',
+                marginBottom: '14px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                boxShadow: '0 0 15px rgba(6, 182, 212, 0.25)',
+              }}>
+                <span style={{ fontSize: '24px' }}>🧩</span>
+                <div style={{ fontSize: '12px', color: 'var(--text-primary)', lineHeight: '1.4' }}>
+                  <b style={{ color: 'var(--accent-cyan)', display: 'block', marginBottom: '2px' }}>
+                    Verifikasi Puzzle TikTok Sedang Berlangsung
+                  </b>
+                  Jendela browser Chrome/Edge telah dibuka. Silakan <b>geser slider puzzle</b> pada jendela browser tersebut.
+                  Scraper akan otomatis melanjutkan proses segera setelah puzzle berhasil digeser.
+                </div>
+              </div>
+            )}
+
+            {(statusMessage.toLowerCase().includes('ini saya') || statusMessage.toLowerCase().includes('challenge')) && (
+              <div style={{
+                background: 'rgba(236, 72, 153, 0.12)',
+                border: '1.5px solid var(--accent-pink)',
+                borderRadius: '10px',
+                padding: '12px 16px',
+                marginBottom: '14px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                boxShadow: '0 0 15px rgba(236, 72, 153, 0.25)',
+              }}>
+                <span style={{ fontSize: '24px' }}>📱</span>
+                <div style={{ fontSize: '12px', color: 'var(--text-primary)', lineHeight: '1.4' }}>
+                  <b style={{ color: 'var(--accent-pink)', display: 'block', marginBottom: '2px' }}>
+                    Instagram Memerlukan Konfirmasi 'Ini Saya'
+                  </b>
+                  1. Buka aplikasi Instagram di ponsel Anda.<br />
+                  2. Ketuk notifikasi atau banner keamanan, lalu pilih <b>'Ini Saya'</b> (This Was Me).<br />
+                  3. Klik tombol <b>'Mulai Scraping &amp; Analisis'</b> kembali di aplikasi ini (identitas perangkat Anda telah disimpan).<br />
+                  <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
+                    💡 Tips: Anda juga dapat beralih ke tab <b>'Cookie Session ID'</b> untuk login tanpa challenge.
+                  </span>
+                </div>
               </div>
             )}
 
