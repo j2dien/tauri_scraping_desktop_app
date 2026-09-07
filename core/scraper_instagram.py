@@ -277,23 +277,62 @@ def _paginate_clips_by_date(
     user_id: str,
     start_date: datetime,
     end_date: datetime,
+    already_found_ids: set = None,
     progress_callback: Optional[Callable[[Any], None]] = None,
 ) -> list:
-    """Ambil reels/clips secara presisi, berhenti begitu melewati start_date.
+    """Ambil reels/clips dari terbaru ke terlama, hanya ambil yang dalam rentang tanggal.
 
-    user_clips() tidak memiliki versi paginated resmi,
-    jadi kita ambil semua lalu filter presisi berdasarkan tanggal.
+    Strategi cepat:
+    - Hitung estimasi jumlah reels berdasarkan lebar rentang tanggal (misal 30 hari ≈ 60 reels max).
+    - Ambil sekali dengan jumlah terbatas, lalu filter dari terbaru → terlama.
+    - Berhenti iterasi begitu ketemu reels yang sudah melewati start_date.
+    - Skip reels yang sudah ditemukan di feed (via already_found_ids).
     """
+    if already_found_ids is None:
+        already_found_ids = set()
+
+    # Estimasi jumlah reels yang perlu diambil berdasarkan rentang tanggal
+    # Asumsi: rata-rata akun posting ~2 reels/hari
+    days_span = max((end_date - start_date).days, 1)
+    estimated_amount = min(max(days_span * 2, 30), 200)  # Min 30, max 200
+
+    if progress_callback:
+        progress_callback(f"Mengambil ~{estimated_amount} reels terbaru untuk filter tanggal...")
+
     try:
-        clips = cl.user_clips(user_id, amount=0)
+        clips = cl.user_clips(user_id, amount=estimated_amount)
     except Exception:
         return []
 
+    if not clips:
+        return []
+
+    # Filter dari terbaru → terlama, berhenti jika sudah melewati start_date
     collected = []
+    past_count = 0
+
     for clip in clips:
         post_date = clip.taken_at.replace(tzinfo=None)
-        if start_date <= post_date <= end_date:
-            collected.append(clip)
+
+        # Skip jika sudah ada di feed
+        clip_id = getattr(clip, 'id', None) or getattr(clip, 'pk', None)
+        if clip_id and clip_id in already_found_ids:
+            continue
+
+        # Lewati yang lebih baru dari end_date
+        if post_date > end_date:
+            continue
+
+        # Hitung yang melewati start_date
+        if post_date < start_date:
+            past_count += 1
+            # Jika sudah 5 berturut-turut di luar rentang → berhenti (data sudah terurut terbaru-terlama)
+            if past_count >= 5:
+                break
+            continue
+
+        past_count = 0  # Reset counter
+        collected.append(clip)
 
     return collected
 
@@ -363,12 +402,15 @@ def get_posts_in_range(
         if progress_callback:
             progress_callback(f"Mengambil video reels @{clean_target}...")
 
+        # Simpan ID feed agar reels tidak duplikat
+        found_ids = {getattr(m, 'id', None) or getattr(m, 'pk', None) for m in feed_posts}
+
         clips_fetched = False
         try:
-            clips_posts = _paginate_clips_by_date(cl, user_id, start_date, end_date, progress_callback)
-            clips_fetched = bool(clips_posts) or True  # True even if 0 clips found (no error)
+            clips_posts = _paginate_clips_by_date(cl, user_id, start_date, end_date, already_found_ids=found_ids, progress_callback=progress_callback)
+            clips_fetched = True
             if progress_callback:
-                progress_callback(f"✓ Ditemukan {len(clips_posts)} video reels dalam rentang tanggal.")
+                progress_callback(f"✓ Ditemukan {len(clips_posts)} video reels baru dalam rentang tanggal.")
         except Exception as e:
             if progress_callback:
                 progress_callback(f"Private API reels gagal ({str(e)[:80]}), reels dari feed sudah ter-cover.")

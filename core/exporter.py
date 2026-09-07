@@ -96,9 +96,23 @@ def _auto_fit_columns(ws, min_width: int = 12, max_width: int = 55):
 
 
 def _save_workbook_safely(wb: Workbook, target_filename: str) -> str:
-    """Simpan workbook dengan penanganan jika file sedang dibuka oleh user (PermissionError)."""
+    """
+    Simpan workbook dengan penanganan otomatis:
+    - Jika file dengan nama yang sama sudah ada, buat file baru dengan suffix timestamp jam.
+    - Jika file sedang dibuka/di-lock oleh Excel, buat file baru dengan suffix timestamp.
+    """
     target_path = Path(target_filename)
     target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Jika file sudah ada, buat nama baru dengan timestamp jam
+    if target_path.exists():
+        timestamp = datetime.now().strftime("%H%M%S")
+        alt_path = target_path.with_name(f"{target_path.stem}_{timestamp}{target_path.suffix}")
+        # Jika kebetulan file timestamp juga sudah ada, tambahkan detik unik
+        while alt_path.exists():
+            timestamp = datetime.now().strftime("%H%M%S_%f")
+            alt_path = target_path.with_name(f"{target_path.stem}_{timestamp}{target_path.suffix}")
+        target_path = alt_path
 
     try:
         wb.save(str(target_path))
@@ -120,6 +134,8 @@ def export_to_excel(
     end_date: str,
     platform: str = "Instagram",
     filename: str | None = None,
+    all_comments: list[dict] | None = None,
+    scraped_posts: list[dict] | None = None,
 ) -> str:
     """Export data top commenters dan likes ke file Excel."""
     # Normalisasi detail_comments jika dikirim dalam bentuk dictionary
@@ -245,10 +261,14 @@ def export_to_excel(
         "Tanggal Komentar",
         "Post URL",
         "Like Postingan",
+        "Shares",
+        "Views",
+        "Jumlah Komentar Post",
         "Tanggal Post",
         "Caption Post",
     ]
     _style_header(ws_detail, detail_headers, fill_color="2E75B6")
+    detail_col_count = len(detail_headers)
 
     for i, comment in enumerate(comments_list):
         row = i + 2
@@ -259,11 +279,14 @@ def export_to_excel(
         ws_detail.cell(row=row, column=5, value=clean_cell_value(format_tanggal_indonesia(comment.get("comment_date", "N/A"))))
         ws_detail.cell(row=row, column=6, value=clean_cell_value(comment.get("post_url", "")))
         ws_detail.cell(row=row, column=7, value=comment.get("post_likes", 0))
-        ws_detail.cell(row=row, column=8, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
-        ws_detail.cell(row=row, column=9, value=clean_cell_value(comment.get("post_caption", "")))
+        ws_detail.cell(row=row, column=8, value=comment.get("post_shares", 0))
+        ws_detail.cell(row=row, column=9, value=comment.get("post_views", 0))
+        ws_detail.cell(row=row, column=10, value=comment.get("post_comments_count", 0))
+        ws_detail.cell(row=row, column=11, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
+        ws_detail.cell(row=row, column=12, value=clean_cell_value(comment.get("post_caption", "")))
 
         if i % 2 == 1:
-            for col in range(1, 10):
+            for col in range(1, detail_col_count + 1):
                 ws_detail.cell(row=row, column=col).fill = data_fill_even
 
     _auto_fit_columns(ws_detail)
@@ -278,20 +301,39 @@ def export_to_excel(
         "Caption Post",
     ]
     _style_header(ws_posts, posts_headers, fill_color="107C41")
+    posts_col_count = len(posts_headers)
 
-    # Kumpulkan postingan unik dari comments_list
+    # Kumpulkan postingan unik — prioritaskan scraped_posts (daftar asli dari scraper)
+    # agar postingan tanpa komentar tetap muncul
     unique_posts = []
     seen_urls = set()
-    for c in comments_list:
-        p_url = c.get("post_url")
-        if p_url and p_url not in seen_urls:
-            seen_urls.add(p_url)
-            unique_posts.append({
-                "post_url": p_url,
-                "post_likes": c.get("post_likes", 0),
-                "post_date": c.get("post_date", "N/A"),
-                "post_caption": c.get("post_caption", ""),
-            })
+
+    # 1. Dari scraped_posts (sumber utama, berisi SEMUA postingan dalam rentang tanggal)
+    if scraped_posts:
+        for p in scraped_posts:
+            p_url = p.get("post_url")
+            if p_url and p_url not in seen_urls:
+                seen_urls.add(p_url)
+                unique_posts.append({
+                    "post_url": p_url,
+                    "post_likes": p.get("post_likes", 0),
+                    "post_date": p.get("post_date", "N/A"),
+                    "post_caption": p.get("post_caption", ""),
+                })
+
+    # 2. Fallback: dari all_comments atau comments_list jika scraped_posts tidak tersedia
+    if not unique_posts:
+        source_for_posts = all_comments if all_comments else comments_list
+        for c in source_for_posts:
+            p_url = c.get("post_url")
+            if p_url and p_url not in seen_urls:
+                seen_urls.add(p_url)
+                unique_posts.append({
+                    "post_url": p_url,
+                    "post_likes": c.get("post_likes", 0),
+                    "post_date": c.get("post_date", "N/A"),
+                    "post_caption": c.get("post_caption", ""),
+                })
 
     unique_posts.sort(key=lambda x: x.get("post_likes", 0), reverse=True)
 
@@ -304,7 +346,7 @@ def export_to_excel(
         ws_posts.cell(row=row, column=5, value=clean_cell_value(p.get("post_caption", "")))
 
         if i % 2 == 0:
-            for col in range(1, 6):
+            for col in range(1, posts_col_count + 1):
                 ws_posts.cell(row=row, column=col).fill = data_fill_even
 
     _auto_fit_columns(ws_posts)

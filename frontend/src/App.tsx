@@ -293,6 +293,10 @@ export default function App(): React.JSX.Element {
       setIsLoading(false);
       setStatusMessage(`Error: ${message}`);
       setProgressLog((prev) => [...prev, { time: timeStr, text: `✗ ${message}`, type: 'error' }]);
+    } else if (type === 'cancelled') {
+      setIsLoading(false);
+      setStatusMessage(`Dibatalkan: ${message}`);
+      setProgressLog((prev) => [...prev, { time: timeStr, text: `⊞ ${message}`, type: 'cancelled' }]);
     }
   };
 
@@ -382,6 +386,18 @@ export default function App(): React.JSX.Element {
     }
   };
 
+  // Cancel Analysis
+  const handleCancelAnalysis = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/cancel`, { method: 'POST' });
+      if (res.ok) {
+        setStatusMessage('Membatalkan proses...');
+      }
+    } catch (e: any) {
+      console.error('Cancel error:', e);
+    }
+  };
+
   // Export to Excel
   const handleExportExcel = async () => {
     if (!analysisResult) return;
@@ -394,6 +410,8 @@ export default function App(): React.JSX.Element {
         body: JSON.stringify({
           top_commenters: analysisResult.top_commenters || [],
           detail_comments: analysisResult.detail_comments || [],
+          all_comments: analysisResult.all_comments || [],
+          scraped_posts: analysisResult.scraped_posts || [],
           summary_stats: analysisResult.summary || {},
           target_username: target.replace('@', '').trim(),
           start_date: startDate,
@@ -726,7 +744,6 @@ export default function App(): React.JSX.Element {
                       <ol style={{ paddingLeft: '16px', margin: '6px 0 0 0' }}>
                         <li>Buka <b>instagram.com</b> di browser Chrome/Edge dan pastikan sudah login.</li>
                         <li>Tekan <b>F12</b> (Inspect Element), buka tab <b>Application</b> (atau Storage).</li>
-                        <li>Di panel kiri, klik <b>Cookies</b> &gt; <b>https://www.instagram.com</b>.</li>
                         <li>Cari nama <b>sessionid</b>, klik dua kali nilainya, copy, lalu paste di kotak di atas.</li>
                       </ol>
                     </div>
@@ -736,21 +753,49 @@ export default function App(): React.JSX.Element {
             </div>
           )}
 
-          {/* Action Button */}
-          <button
-            className="btn-gradient"
-            onClick={handleStartAnalysis}
-            disabled={isLoading}
-            style={{ width: '100%', padding: '14px', fontSize: '15px' }}
-          >
-            {isLoading ? (
-              <>
-                <span className="spinner">⏳</span> Sedang Menganalisis...
-              </>
-            ) : (
-              '🚀 Mulai Scraping & Analisis'
+          {/* Action Buttons */}
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button
+              className="btn-gradient"
+              onClick={handleStartAnalysis}
+              disabled={isLoading}
+              style={{ flex: 1, padding: '14px', fontSize: '15px' }}
+            >
+              {isLoading ? (
+                <>
+                  <span className="spinner">⏳</span> Sedang Menganalisis...
+                </>
+              ) : (
+                '🚀 Mulai Scraping & Analisis'
+              )}
+            </button>
+            {isLoading && (
+              <button
+                onClick={handleCancelAnalysis}
+                style={{
+                  padding: '14px 20px',
+                  fontSize: '15px',
+                  borderRadius: '14px',
+                  border: '1.5px solid rgba(239, 68, 68, 0.5)',
+                  background: 'rgba(239, 68, 68, 0.15)',
+                  color: '#ef4444',
+                  fontWeight: '700',
+                  cursor: 'pointer',
+                  transition: 'all 0.2s ease',
+                }}
+                onMouseOver={(e) => {
+                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.3)';
+                  e.currentTarget.style.borderColor = '#ef4444';
+                }}
+                onMouseOut={(e) => {
+                  e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)';
+                  e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+                }}
+              >
+                ✗ Batal
+              </button>
             )}
-          </button>
+          </div>
         </div>
 
         {/* Right Column: Live Monitor, Results, and Tables */}

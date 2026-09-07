@@ -52,12 +52,14 @@ export interface AnalysisResultPayload {
   top_commenters: TopCommenter[];
   summary: SummaryStats;
   detail_comments: UserCommentDetail[] | Record<string, UserCommentDetail[]>;
+  all_comments: Record<string, any>[];
+  scraped_posts: Record<string, any>[];
   total_posts: number;
   total_comments: number;
 }
 
 export interface WebSocketMessage {
-  type: 'started' | 'status' | 'log' | 'post_found' | 'comment_progress' | 'completed' | 'error';
+  type: 'started' | 'status' | 'log' | 'post_found' | 'comment_progress' | 'completed' | 'error' | 'cancelled';
   message: string;
   payload?: any;
   timestamp?: string;
@@ -66,7 +68,7 @@ export interface WebSocketMessage {
 export interface LogEntry {
   time: string;
   text: string;
-  type: 'info' | 'log' | 'success' | 'completed' | 'error';
+  type: 'info' | 'log' | 'success' | 'completed' | 'error' | 'cancelled';
 }
 
 export interface IndonesianDatePickerProps {

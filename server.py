@@ -52,6 +52,9 @@ current_task_state: Dict[str, Any] = {
     "last_updated": datetime.now().isoformat()
 }
 
+# Flag pembatalan proses scraping (thread-safe)
+cancel_event = threading.Event()
+
 # WebSocket Manager untuk Live Progress Logging
 class ConnectionManager:
     def __init__(self):
@@ -172,6 +175,14 @@ def sync_broadcast(event_type: str, message: str, payload: Any = None):
             "text": f"✗ {message}",
             "type": "error"
         })
+    elif event_type == "cancelled":
+        current_task_state["is_running"] = False
+        current_task_state["error"] = message
+        current_task_state["logs"].append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "text": f"⊘ {message}",
+            "type": "cancelled"
+        })
 
     # Batasi riwayat log maksimal 200 baris
     if len(current_task_state["logs"]) > 200:
@@ -188,6 +199,15 @@ def sync_broadcast(event_type: str, message: str, payload: Any = None):
 def get_progress_state():
     """Endpoint polling progress untuk memastikan UI tidak pernah freeze."""
     return current_task_state
+
+
+@app.post("/api/cancel")
+def cancel_analysis():
+    """Batalkan proses scraping yang sedang berjalan."""
+    if current_task_state["is_running"]:
+        cancel_event.set()
+        return {"status": "cancelling", "message": "Permintaan pembatalan telah dikirim."}
+    return {"status": "idle", "message": "Tidak ada proses yang berjalan."}
 
 
 class AnalyzeRequest(BaseModel):
@@ -208,6 +228,8 @@ class ClearSessionRequest(BaseModel):
 class ExportRequest(BaseModel):
     top_commenters: List[Dict[str, Any]] = []
     detail_comments: Any = []
+    all_comments: List[Dict[str, Any]] = []
+    scraped_posts: List[Dict[str, Any]] = []
     summary_stats: Dict[str, Any] = {}
     target_username: str = ""
     start_date: str = ""
@@ -249,6 +271,12 @@ async def run_analysis(req: AnalyzeRequest):
 
     init_msg = f"Memulai analisis {req.platform.upper()} untuk target: @{req.target}"
     reset_task_state(init_msg)
+    cancel_event.clear()  # Reset flag pembatalan
+
+    def check_cancelled():
+        """Cek apakah proses telah dibatalkan oleh user."""
+        if cancel_event.is_set():
+            raise InterruptedError("Proses dibatalkan oleh pengguna.")
 
     def run_task():
         try:
@@ -257,6 +285,7 @@ async def run_analysis(req: AnalyzeRequest):
 
             if req.platform.lower() == "tiktok":
                 def on_tiktok_post(item):
+                    check_cancelled()
                     if isinstance(item, str):
                         sync_broadcast("status", item)
                         sync_broadcast("log", item)
@@ -273,6 +302,7 @@ async def run_analysis(req: AnalyzeRequest):
                 sync_broadcast("status", f"Ditemukan {len(posts)} postingan. Mengambil komentar...")
 
                 def on_tiktok_comm_progress(curr, total, item, count):
+                    check_cancelled()
                     sync_broadcast("comment_progress", f"Mengambil komentar postingan {curr}/{total}: {count} komentar", {
                         "current": curr,
                         "total": total,
@@ -286,6 +316,7 @@ async def run_analysis(req: AnalyzeRequest):
                 cl = create_client()
 
                 def on_ig_login_log(msg: str):
+                    check_cancelled()
                     sync_broadcast("status", msg)
                     sync_broadcast("log", msg)
 
@@ -323,6 +354,7 @@ async def run_analysis(req: AnalyzeRequest):
                     return
 
                 def on_ig_post_log(msg: Any):
+                    check_cancelled()
                     if isinstance(msg, str):
                         sync_broadcast("status", msg)
                         sync_broadcast("log", msg)
@@ -347,6 +379,7 @@ async def run_analysis(req: AnalyzeRequest):
                 sync_broadcast("status", f"Ditemukan {len(posts)} postingan dalam rentang tanggal. Mengambil komentar...")
 
                 def on_ig_comm_progress(curr, total, media, total_comms, msg_text=""):
+                    check_cancelled()
                     display_text = msg_text or f"Mengambil komentar postingan {curr}/{total} (Total: {total_comms} komentar)"
                     sync_broadcast("comment_progress", display_text, {
                         "current": curr,
@@ -365,15 +398,42 @@ async def run_analysis(req: AnalyzeRequest):
             top_usernames = [c["username"] for c in top_commenters]
             detail_comments = get_detailed_comments_by_user(all_comments, top_usernames)
 
+            # Serialisasi daftar postingan ke format dict seragam
+            scraped_posts = []
+            for p in posts:
+                if isinstance(p, dict):
+                    # TikTok posts sudah berupa dict
+                    scraped_posts.append({
+                        "post_url": p.get("post_url", ""),
+                        "post_likes": p.get("post_likes", 0),
+                        "post_date": p.get("post_date", "N/A"),
+                        "post_caption": p.get("post_caption", ""),
+                    })
+                else:
+                    # Instagram media objects
+                    post_code = getattr(p, 'code', '') or str(getattr(p, 'pk', ''))
+                    taken_at_str = p.taken_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(p, 'taken_at') and p.taken_at else "N/A"
+                    caption = getattr(p, 'caption_text', '') or ''
+                    scraped_posts.append({
+                        "post_url": f"https://www.instagram.com/p/{post_code}/",
+                        "post_likes": getattr(p, 'like_count', 0) or 0,
+                        "post_date": taken_at_str,
+                        "post_caption": (caption[:100] + "...") if caption and len(caption) > 100 else caption,
+                    })
+
             # Kirim hasil lengkap ke frontend
             sync_broadcast("completed", "Analisis berhasil selesai!", {
                 "top_commenters": top_commenters,
                 "summary": summary,
                 "detail_comments": detail_comments,
+                "all_comments": all_comments,
+                "scraped_posts": scraped_posts,
                 "total_posts": len(posts),
                 "total_comments": len(all_comments),
             })
 
+        except InterruptedError:
+            sync_broadcast("cancelled", "Proses scraping dibatalkan oleh pengguna.")
         except Exception as e:
             sync_broadcast("error", f"Terjadi kesalahan: {str(e)}")
 
@@ -400,6 +460,8 @@ def export_results(req: ExportRequest):
         saved_path = export_to_excel(
             top_commenters=req.top_commenters,
             detail_comments=req.detail_comments,
+            all_comments=req.all_comments,
+            scraped_posts=req.scraped_posts,
             summary_stats=req.summary_stats,
             target_username=safe_user,
             start_date=req.start_date,
