@@ -56,14 +56,34 @@ def count_top_commenters(comments: list[dict], top_n: int = 10) -> list[dict]:
         unique_urls = list({c["post_url"] for c in user_comments if c.get("post_url")})
         unique_posts = list({c["post_shortcode"] for c in user_comments if c.get("post_shortcode")})
 
-        # Hitung status apakah user melakukan like pada post yang dikomentari
-        liked_posts_count = sum(1 for c in user_comments if c.get("has_liked_post") == "Ya")
-        is_tiktok_na = all("N/A" in str(c.get("has_liked_post", "")) for c in user_comments)
+        # Hitung per post unik agar beberapa komentar pada post yang sama tidak
+        # menggandakan jumlah like. Status yang disembunyikan Instagram tidak
+        # boleh dianggap sebagai "Tidak".
+        like_status_by_post = {}
+        for c in user_comments:
+            p_key = c.get("post_url") or c.get("post_shortcode")
+            if p_key and p_key not in like_status_by_post:
+                like_status_by_post[p_key] = str(c.get("has_liked_post") or "N/A")
 
-        if is_tiktok_na:
+        liked_posts_count = sum(1 for status in like_status_by_post.values() if status == "Ya")
+        checkable_posts_count = sum(
+            1 for status in like_status_by_post.values() if status in {"Ya", "Tidak"}
+        )
+        all_na = bool(like_status_by_post) and all(
+            status == "N/A" for status in like_status_by_post.values()
+        )
+        all_hidden = bool(like_status_by_post) and all(
+            status == "Disembunyikan Instagram" for status in like_status_by_post.values()
+        )
+
+        if all_na:
             like_status_display = "N/A"
         elif liked_posts_count > 0:
             like_status_display = f"Ya ({liked_posts_count}/{len(unique_post_likes)})"
+        elif all_hidden:
+            like_status_display = "Disembunyikan Instagram"
+        elif checkable_posts_count == 0:
+            like_status_display = "Tidak dapat dicek"
         else:
             like_status_display = "Tidak"
 

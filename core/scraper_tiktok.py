@@ -14,7 +14,8 @@ import json
 import re
 import time
 import requests
-from datetime import datetime, timedelta
+from html import unescape
+from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
@@ -82,6 +83,111 @@ def extract_timestamp_from_post_id(post_id: str | int) -> Optional[datetime]:
     return None
 
 
+def _find_post_item(obj, post_id: str) -> Optional[dict]:
+    """Cari item post yang ID-nya tepat, bukan item pertama di payload TikTok."""
+    target_id = str(post_id)
+    fallback = None
+    stack = [obj]
+
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            item_struct = current.get("itemStruct")
+            if isinstance(item_struct, dict):
+                stack.append(item_struct)
+
+            looks_like_post = (
+                ("desc" in current or "description" in current)
+                and ("createTime" in current or "uploadDate" in current)
+            )
+            if looks_like_post:
+                current_id = current.get("id") or current.get("aweme_id")
+                if current_id is not None and str(current_id) == target_id:
+                    return current
+                # Payload JSON-LD kadang tidak menyertakan ID. Item tanpa ID
+                # masih aman sebagai fallback; item dengan ID berbeda tidak.
+                if current_id is None and fallback is None:
+                    fallback = current
+
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+
+    return fallback
+
+
+def _decode_json_string(value: str) -> str:
+    """Decode escape JSON pada hasil regex caption dengan aman."""
+    try:
+        return str(json.loads(f'"{value}"')).strip()
+    except (json.JSONDecodeError, TypeError):
+        return unescape(str(value)).strip()
+
+
+def _apply_post_item(result: dict, item: dict) -> None:
+    """Salin metadata item TikTok ke result dan tandai caption terverifikasi."""
+    c_time = _safe_int(item.get("createTime", 0))
+    if c_time:
+        result["post_date"] = datetime.fromtimestamp(c_time).strftime("%Y-%m-%d %H:%M:%S")
+
+    if "desc" in item or "description" in item:
+        result["post_caption"] = str(item.get("desc", item.get("description", "")) or "").strip()
+        # Nilai kosong tetap valid: beberapa postingan memang tidak memiliki caption.
+        result["_caption_resolved"] = True
+
+    stats = item.get("stats", {}) or item.get("statsV2", {}) or {}
+    result["post_likes"] = _safe_int(stats.get("diggCount", 0))
+    result["post_shares"] = _safe_int(stats.get("shareCount", 0))
+    result["post_comments_count"] = _safe_int(stats.get("commentCount", 0))
+    result["post_views"] = _safe_int(stats.get("playCount", 0))
+
+
+def _extract_caption_from_meta(html_content: str) -> str:
+    """Fallback caption dari metadata SEO TikTok pada halaman post."""
+    for tag in re.findall(r"<meta\b[^>]*>", html_content, re.IGNORECASE | re.DOTALL):
+        attrs = {
+            key.lower(): unescape(value).strip()
+            for key, _, value in re.findall(
+                r"([:\w-]+)\s*=\s*(['\"])(.*?)\2",
+                tag,
+                re.DOTALL,
+            )
+        }
+        meta_name = (attrs.get("property") or attrs.get("name") or "").lower()
+        if meta_name not in {"og:description", "twitter:description", "description"}:
+            continue
+
+        content = attrs.get("content", "").strip()
+        if not content:
+            continue
+
+        # Deskripsi SEO TikTok umumnya membungkus caption dengan tanda kutip ini.
+        quoted_caption = re.search(r"[“‘](.*?)[”’]", content, re.DOTALL)
+        if quoted_caption:
+            return quoted_caption.group(1).strip()
+
+    return ""
+
+
+def _extract_caption_from_page(page) -> str:
+    """Ambil caption yang sudah dirender dari selector video maupun photo TikTok."""
+    selectors = [
+        '[data-e2e="browse-video-desc"]',
+        '[data-e2e="video-desc"]',
+        'h1[data-e2e*="desc"]',
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0:
+                caption = locator.first.inner_text(timeout=1500).strip()
+                if caption:
+                    return caption
+        except Exception:
+            pass
+    return ""
+
+
 def _extract_post_data_from_html(html_content: str, post_id: str, approx_dt: Optional[datetime] = None) -> dict:
     """
     Parse data postingan dari konten HTML halaman TikTok.
@@ -104,6 +210,7 @@ def _extract_post_data_from_html(html_content: str, post_id: str, approx_dt: Opt
         "post_shares": 0,
         "post_comments_count": 0,
         "post_views": 0,
+        "_caption_resolved": False,
     }
 
     # 1. Parse JSON rehydration data jika ada
@@ -111,40 +218,10 @@ def _extract_post_data_from_html(html_content: str, post_id: str, approx_dt: Opt
     if match:
         try:
             data = json.loads(match.group(1))
-            scope = data.get("__DEFAULT_SCOPE__", {})
-
-            def find_item_struct(obj):
-                if isinstance(obj, dict):
-                    if "itemStruct" in obj and isinstance(obj["itemStruct"], dict):
-                        return obj["itemStruct"]
-                    if "desc" in obj and "createTime" in obj and ("id" in obj or "author" in obj):
-                        return obj
-                    for v in obj.values():
-                        res = find_item_struct(v)
-                        if res:
-                            return res
-                elif isinstance(obj, list):
-                    for elem in obj:
-                        res = find_item_struct(elem)
-                        if res:
-                            return res
-                return None
-
-            item = find_item_struct(scope)
+            scope = data.get("__DEFAULT_SCOPE__", data)
+            item = _find_post_item(scope, post_id)
             if item:
-                c_time = int(item.get("createTime", 0))
-                if c_time:
-                    result["post_date"] = datetime.fromtimestamp(c_time).strftime("%Y-%m-%d %H:%M:%S")
-
-                result["post_caption"] = item.get("desc", "") or ""
-
-                # Coba stats dan statsV2
-                stats = item.get("stats", {}) or item.get("statsV2", {}) or {}
-                result["post_likes"] = _safe_int(stats.get("diggCount", 0))
-                result["post_shares"] = _safe_int(stats.get("shareCount", 0))
-                result["post_comments_count"] = _safe_int(stats.get("commentCount", 0))
-                result["post_views"] = _safe_int(stats.get("playCount", 0))
-
+                _apply_post_item(result, item)
                 return result
         except Exception:
             pass
@@ -159,58 +236,30 @@ def _extract_post_data_from_html(html_content: str, post_id: str, approx_dt: Opt
             try:
                 alt_data = json.loads(alt_match.group(1))
 
-                def deep_find_item(obj, depth=0):
-                    if depth > 8:
-                        return None
-                    if isinstance(obj, dict):
-                        if "desc" in obj and "createTime" in obj:
-                            return obj
-                        if "itemInfo" in obj and isinstance(obj["itemInfo"], dict):
-                            inner = obj["itemInfo"].get("itemStruct")
-                            if inner:
-                                return inner
-                        for v in obj.values():
-                            r = deep_find_item(v, depth + 1)
-                            if r:
-                                return r
-                    elif isinstance(obj, list):
-                        for elem in obj:
-                            r = deep_find_item(elem, depth + 1)
-                            if r:
-                                return r
-                    return None
-
-                found = deep_find_item(alt_data)
+                found = _find_post_item(alt_data, post_id)
                 if found:
-                    c_time = int(found.get("createTime", 0))
-                    if c_time:
-                        result["post_date"] = datetime.fromtimestamp(c_time).strftime("%Y-%m-%d %H:%M:%S")
-                    result["post_caption"] = found.get("desc", "") or ""
-                    stats = found.get("stats", {}) or found.get("statsV2", {}) or {}
-                    result["post_likes"] = _safe_int(stats.get("diggCount", 0))
-                    result["post_shares"] = _safe_int(stats.get("shareCount", 0))
-                    result["post_comments_count"] = _safe_int(stats.get("commentCount", 0))
-                    result["post_views"] = _safe_int(stats.get("playCount", 0))
+                    _apply_post_item(result, found)
                     return result
             except Exception:
                 pass
 
     # 3. Regex fallback untuk data individual
     # Caption
+    escaped_id = re.escape(str(post_id))
+    json_string = r'((?:\\.|[^"\\])*)'
     item_struct_match = (
-        re.search(r'"itemStruct":\{[^{}]*"desc":"([^"]+)"', html_content)
-        or re.search(r'"desc":"([^"]+)"[^{}]*"createTime"', html_content)
+        re.search(rf'"id":"?{escaped_id}"?.{{0,5000}}?"desc":"{json_string}"', html_content, re.DOTALL)
+        or re.search(rf'"desc":"{json_string}".{{0,5000}}?"id":"?{escaped_id}"?', html_content, re.DOTALL)
     )
     if item_struct_match:
-        caption = item_struct_match.group(1)
-        # Filter jika caption hasil regex adalah reply comment
-        if "comment:" in caption.lower():
-            desc_all = re.findall(r'"desc":"([^"]+)"', html_content)
-            for d in desc_all:
-                if "comment:" not in d.lower() and "point of view" not in d.lower() and "Lihat video" not in d:
-                    caption = d
-                    break
-        result["post_caption"] = caption
+        result["post_caption"] = _decode_json_string(item_struct_match.group(1))
+        result["_caption_resolved"] = True
+
+    if not result["_caption_resolved"]:
+        meta_caption = _extract_caption_from_meta(html_content)
+        if meta_caption:
+            result["post_caption"] = meta_caption
+            result["_caption_resolved"] = True
 
     # createTime
     c_time_match = re.search(r'"createTime":"?(\d+)"?', html_content)
@@ -275,6 +324,7 @@ def get_post_details_via_playwright(page, post_url: str, post_id: str, approx_dt
         "post_shares": 0,
         "post_comments_count": 0,
         "post_views": 0,
+        "_caption_resolved": False,
     }
 
     for attempt in range(2):
@@ -290,6 +340,11 @@ def get_post_details_via_playwright(page, post_url: str, post_id: str, approx_dt
                 html_content = page.content()
 
             result = _extract_post_data_from_html(html_content, post_id, approx_dt)
+            if not result.get("_caption_resolved"):
+                dom_caption = _extract_caption_from_page(page)
+                if dom_caption:
+                    result["post_caption"] = dom_caption
+                    result["_caption_resolved"] = True
 
             # Jika berhasil mendapatkan data yang bermakna, return
             if result["post_date"] != approx_str or result["post_caption"] or result["post_likes"] > 0:
@@ -300,6 +355,11 @@ def get_post_details_via_playwright(page, post_url: str, post_id: str, approx_dt
                 time.sleep(2)
                 html_content = page.content()
                 result = _extract_post_data_from_html(html_content, post_id, approx_dt)
+                if not result.get("_caption_resolved"):
+                    dom_caption = _extract_caption_from_page(page)
+                    if dom_caption:
+                        result["post_caption"] = dom_caption
+                        result["_caption_resolved"] = True
                 if result["post_date"] != approx_str or result["post_caption"] or result["post_likes"] > 0:
                     return result
 
@@ -367,7 +427,31 @@ def get_tiktok_post_details(session: requests.Session, post_id: str, post_type: 
         "post_shares": 0,
         "post_comments_count": 0,
         "post_views": 0,
+        "_caption_resolved": False,
     }
+
+
+def get_tiktok_caption_via_oembed(
+    session: requests.Session,
+    post_url: str,
+) -> Optional[str]:
+    """Ambil caption melalui endpoint oEmbed resmi TikTok sebagai fallback terakhir."""
+    try:
+        response = session.get(
+            "https://www.tiktok.com/oembed",
+            params={"url": post_url},
+            timeout=12,
+            headers=DESKTOP_HEADERS,
+        )
+        if response.status_code != 200:
+            return None
+
+        payload = response.json()
+        if "title" not in payload:
+            return None
+        return str(payload.get("title") or "").strip()
+    except Exception:
+        return None
 
 
 def auto_scrape_tiktok_profile_posts(
@@ -451,8 +535,9 @@ def auto_scrape_tiktok_profile_posts(
             pass
         return False
 
-    def collect_from_page(page) -> int:
-        new_count = 0
+    def collect_from_page(page) -> list[dict]:
+        """Kumpulkan postingan baru yang terlihat pada halaman saat ini."""
+        new_posts = []
         try:
             # 1. Dari seluruh anchor tag di DOM
             hrefs = page.evaluate("""() => {
@@ -473,7 +558,7 @@ def auto_scrape_tiktok_profile_posts(
                             "target_username": clean_username,
                             "approx_date": approx_dt,
                         }
-                        new_count += 1
+                        new_posts.append(posts_dict[p_id])
 
             # 2. Dari konten HTML regex (menangkap video/photo IDs yang belum berupa rendered link)
             content = page.content()
@@ -487,7 +572,7 @@ def auto_scrape_tiktok_profile_posts(
                         "target_username": clean_username,
                         "approx_date": approx_dt,
                     }
-                    new_count += 1
+                    new_posts.append(posts_dict[pid])
 
             for pid in re.findall(r'/video/(\d+)', content):
                 if pid not in posts_dict:
@@ -499,10 +584,10 @@ def auto_scrape_tiktok_profile_posts(
                         "target_username": clean_username,
                         "approx_date": approx_dt,
                     }
-                    new_count += 1
+                    new_posts.append(posts_dict[pid])
         except Exception:
             pass
-        return new_count
+        return new_posts
 
     def _launch_browser_context(playwright_inst, is_headless: bool):
         """Luncurkan browser context dengan fallback channel (msedge -> chrome -> chromium)."""
@@ -641,11 +726,11 @@ def auto_scrape_tiktok_profile_posts(
             _page_ref = page
 
         # Kumpulkan postingan awal
-        initial_count = collect_from_page(page)
+        initial_posts = collect_from_page(page)
 
         # Jika tidak ada postingan ditemukan DAN captcha tidak terdeteksi di polling awal,
         # lakukan pengecekan captcha ulang yang lebih intensif (untuk kasus fresh launch lambat)
-        if initial_count == 0 and not has_captcha:
+        if not initial_posts and not has_captcha:
             if progress_callback:
                 progress_callback("Belum ada postingan ditemukan, memeriksa kemungkinan captcha tersembunyi...")
             time.sleep(3)
@@ -675,14 +760,18 @@ def auto_scrape_tiktok_profile_posts(
         max_scrolls = 50
         scroll_count = 0
         no_new_count = 0
-        cutoff_date = (start_date - timedelta(days=1)) if start_date else None
+        # ID TikTok mengandung timestamp publish, sehingga dapat dipakai untuk
+        # menghentikan scroll tanpa membuka detail setiap postingan terlebih dulu.
+        cutoff_date = start_date
+        consecutive_older_posts = 0
 
         while scroll_count < max_scrolls:
             scroll_count += 1
             page.evaluate("window.scrollBy(0, 1500)")
             time.sleep(1.2)
 
-            new_found = collect_from_page(page)
+            new_posts = collect_from_page(page)
+            new_found = len(new_posts)
 
             if progress_callback:
                 progress_callback(f"Scroll #{scroll_count}: {len(posts_dict)} postingan terdeteksi...")
@@ -720,16 +809,31 @@ def auto_scrape_tiktok_profile_posts(
             else:
                 no_new_count = 0
 
-            # Early termination check: jika postingan paling lama sudah melewati start_date
-            if cutoff_date and len(posts_dict) >= 15:
-                dated_posts = [p for p in posts_dict.values() if p.get("approx_date")]
-                if len(dated_posts) >= 12:
-                    dated_posts.sort(key=lambda x: x["approx_date"], reverse=True)
-                    oldest_posts = dated_posts[-6:]
-                    if all(p["approx_date"] < cutoff_date for p in oldest_posts):
-                        break
+            # Postingan pinned yang lama dapat muncul di bagian paling atas profil.
+            # Karena itu, keputusan berhenti hanya memakai batch BARU hasil scroll,
+            # bukan seluruh DOM. Enam post lama berturut-turut cukup menjadi bukti
+            # feed sudah bergerak melewati tanggal awal yang diminta.
+            if cutoff_date and new_posts:
+                dated_new_posts = [p for p in new_posts if p.get("approx_date")]
+                if dated_new_posts and all(p["approx_date"] < cutoff_date for p in dated_new_posts):
+                    consecutive_older_posts += len(dated_new_posts)
+                elif any(p["approx_date"] >= cutoff_date for p in dated_new_posts):
+                    consecutive_older_posts = 0
 
-        posts_list = list(posts_dict.values())
+                if consecutive_older_posts >= 6:
+                    if progress_callback:
+                        progress_callback(
+                            "Batas awal periode sudah terlewati; menghentikan scroll profil."
+                        )
+                    break
+
+        # Selalu kembalikan kandidat dari posting terbaru ke terlama. Urutan DOM
+        # TikTok tidak dapat dipercaya karena postingan pinned dapat berada di atas.
+        posts_list = sorted(
+            posts_dict.values(),
+            key=lambda item: item.get("approx_date") or datetime.min,
+            reverse=True,
+        )
 
         # Jika return_context = True, jangan tutup browser context (akan dipakai enrichment)
         if return_context:
@@ -848,6 +952,31 @@ def get_tiktok_posts_in_range(
         _cleanup_playwright(pw_context, pw_instance)
         return []
 
+    # Snowflake ID TikTok menyimpan waktu publish pada 32 bit teratas. Gunakan
+    # timestamp ini untuk membuang post di luar periode SEBELUM enrichment
+    # Playwright yang mahal. Kandidat tanpa timestamp tetap dipertahankan agar
+    # dapat diverifikasi dari metadata asli halaman post.
+    candidate_posts.sort(
+        key=lambda item: item.get("approx_date") or datetime.min,
+        reverse=True,
+    )
+    detected_count = len(candidate_posts)
+    candidate_posts = [
+        item for item in candidate_posts
+        if not item.get("approx_date") or start_date <= item["approx_date"] <= end_date
+    ]
+
+    if progress_callback:
+        skipped_count = detected_count - len(candidate_posts)
+        progress_callback(
+            f"Seleksi cepat periode: {len(candidate_posts)} postingan akan diproses"
+            f" ({skipped_count} di luar periode dilewati)."
+        )
+
+    if not candidate_posts:
+        _cleanup_playwright(pw_context, pw_instance)
+        return []
+
     # ── FASE ENRICHMENT: Ambil data lengkap dari setiap post via Playwright ──
     if progress_callback:
         progress_callback(f"Mengambil detail lengkap {len(candidate_posts)} postingan dari TikTok...")
@@ -915,8 +1044,12 @@ def get_tiktok_posts_in_range(
             except Exception:
                 details = None
 
-        # Metode 2: Fallback ke HTTP request jika Playwright gagal
-        if not details or (not details.get("post_caption") and details.get("post_likes", 0) == 0):
+        # Metode 2: fallback juga wajib berjalan bila caption belum berhasil
+        # diverifikasi, meskipun jumlah like sudah ditemukan oleh Playwright.
+        caption_unresolved = bool(details) and not details.get(
+            "_caption_resolved", bool(details.get("post_caption"))
+        )
+        if not details or caption_unresolved:
             try:
                 details_http = get_tiktok_post_details(session_fallback, p_id, p_type, p_user)
                 # Gabungkan: pakai data terbaik dari kedua sumber
@@ -926,12 +1059,23 @@ def get_tiktok_posts_in_range(
                             details[key] = details_http[key]
                     if details.get("post_date", "N/A") == "N/A" and details_http.get("post_date", "N/A") != "N/A":
                         details["post_date"] = details_http["post_date"]
+                    if details_http.get("_caption_resolved"):
+                        details["post_caption"] = details_http.get("post_caption", "")
+                        details["_caption_resolved"] = True
                 else:
                     details = details_http
             except Exception:
                 pass
 
-        # Jika kedua metode gagal, gunakan data minimal
+        # Metode 3: endpoint resmi oEmbed menyediakan caption pada field title.
+        # Hanya dipanggil untuk post yang caption-nya masih belum terverifikasi.
+        if details and not details.get("_caption_resolved", bool(details.get("post_caption"))):
+            oembed_caption = get_tiktok_caption_via_oembed(session_fallback, post_url)
+            if oembed_caption is not None:
+                details["post_caption"] = oembed_caption
+                details["_caption_resolved"] = True
+
+        # Jika seluruh metode gagal, gunakan data minimal
         if not details:
             approx_dt = post_item.get("approx_date") or extract_timestamp_from_post_id(p_id)
             approx_str = approx_dt.strftime("%Y-%m-%d %H:%M:%S") if approx_dt else "N/A"
@@ -1029,8 +1173,8 @@ def get_tiktok_comments_from_post(
     Args:
         session: Instance requests.Session.
         item: Dict item postingan (berisi id, post_type, post_url, target_username, post_date, post_caption, post_likes).
-        start_date: Tanggal mulai filter.
-        end_date: Tanggal akhir filter.
+        start_date: Tanggal mulai filter postingan.
+        end_date: Tanggal akhir filter postingan.
 
     Returns:
         List of dict data komentar.
@@ -1047,6 +1191,15 @@ def get_tiktok_comments_from_post(
     post_shares = item.get("post_shares", 0)
     post_comments_count = item.get("post_comments_count", 0)
     post_views = item.get("post_views", 0)
+
+    # Pengaman untuk pemanggilan langsung fungsi ini: jangan meminta komentar
+    # apabila timestamp ID sudah memastikan post berada di luar periode.
+    item_date = item.get("real_date") or item.get("approx_date") or extract_timestamp_from_post_id(v_id)
+    if item_date:
+        if start_date and item_date < start_date:
+            return []
+        if end_date and item_date > end_date:
+            return []
 
     if not post_date_str or post_date_str == "N/A":
         post_info = get_tiktok_post_details(session, v_id, p_type, username)
@@ -1100,7 +1253,7 @@ def get_tiktok_comments_from_post(
                     "post_comments_count": post_comments_count,
                     "post_views": post_views,
                     "post_date": post_date_str,
-                    "post_caption": (post_caption_str[:100] + "...") if post_caption_str and len(post_caption_str) > 100 else (post_caption_str or ""),
+                    "post_caption": post_caption_str or "",
                 })
 
             cursor = data.get("cursor", 0)
@@ -1131,8 +1284,8 @@ def get_all_tiktok_comments(
 
     Args:
         posts: List of post items.
-        start_date: Tanggal mulai filter komentar.
-        end_date: Tanggal akhir filter komentar.
+        start_date: Tanggal mulai filter postingan.
+        end_date: Tanggal akhir filter postingan.
         progress_callback: Callback (current, total, item, comment_count).
 
     Returns:
@@ -1142,9 +1295,16 @@ def get_all_tiktok_comments(
     session.headers.update(MOBILE_HEADERS)
 
     all_comments = []
-    total = len(posts)
+    # Pastikan komentar dikoleksi per postingan dari yang terbaru ke terlama,
+    # terlepas dari urutan input yang diberikan pemanggil.
+    ordered_posts = sorted(
+        posts,
+        key=lambda item: item.get("real_date") or item.get("approx_date") or datetime.min,
+        reverse=True,
+    )
+    total = len(ordered_posts)
 
-    for i, item in enumerate(posts):
+    for i, item in enumerate(ordered_posts):
         s_date = start_date or item.get("start_date")
         e_date = end_date or item.get("end_date")
 

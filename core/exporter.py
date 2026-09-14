@@ -261,9 +261,6 @@ def export_to_excel(
         "Tanggal Komentar",
         "Post URL",
         "Like Postingan",
-        "Shares",
-        "Views",
-        "Jumlah Komentar Post",
         "Tanggal Post",
         "Caption Post",
     ]
@@ -279,11 +276,8 @@ def export_to_excel(
         ws_detail.cell(row=row, column=5, value=clean_cell_value(format_tanggal_indonesia(comment.get("comment_date", "N/A"))))
         ws_detail.cell(row=row, column=6, value=clean_cell_value(comment.get("post_url", "")))
         ws_detail.cell(row=row, column=7, value=comment.get("post_likes", 0))
-        ws_detail.cell(row=row, column=8, value=comment.get("post_shares", 0))
-        ws_detail.cell(row=row, column=9, value=comment.get("post_views", 0))
-        ws_detail.cell(row=row, column=10, value=comment.get("post_comments_count", 0))
-        ws_detail.cell(row=row, column=11, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
-        ws_detail.cell(row=row, column=12, value=clean_cell_value(comment.get("post_caption", "")))
+        ws_detail.cell(row=row, column=8, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
+        ws_detail.cell(row=row, column=9, value=clean_cell_value(comment.get("post_caption", "")))
 
         if i % 2 == 1:
             for col in range(1, detail_col_count + 1):

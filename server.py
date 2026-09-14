@@ -32,6 +32,7 @@ from core.scraper_instagram import (
     create_client, login_instagram, login_by_sessionid,
     get_posts_in_range as get_ig_posts_in_range,
     get_all_comments as get_ig_comments,
+    get_instagram_media_url,
     LoginRequiredError as IGLoginRequiredError,
     get_session_info as get_ig_session_info,
     clear_session as clear_ig_session,
@@ -415,7 +416,7 @@ async def run_analysis(req: AnalyzeRequest):
                     taken_at_str = p.taken_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(p, 'taken_at') and p.taken_at else "N/A"
                     caption = getattr(p, 'caption_text', '') or ''
                     scraped_posts.append({
-                        "post_url": f"https://www.instagram.com/p/{post_code}/",
+                        "post_url": get_instagram_media_url(p),
                         "post_likes": getattr(p, 'like_count', 0) or 0,
                         "post_date": taken_at_str,
                         "post_caption": (caption[:100] + "...") if caption and len(caption) > 100 else caption,
