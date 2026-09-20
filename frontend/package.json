@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "tauri": "tauri",
-    "desktop": "tauri dev",
+    "desktop": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "lint": "oxlint",
     "preview": "vite preview"
   },
