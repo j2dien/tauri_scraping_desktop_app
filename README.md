@@ -16,7 +16,8 @@ Dibangun menggunakan kombinasi teknologi berkinerja tinggi: **Tauri v2 (Rust)**,
   - *Quick Presets*: 7 Hari Terakhir, 14 Hari Terakhir, 30 Hari Terakhir, dan Bulan Ini.
 - 🏆 **Analisis Peringkat Top Commenters**:
   - Penentuan peringkat (Rank #1 s/d Top N) berdasarkan total kuantitas komentar yang ditinggalkan.
-  - Menampilkan waktu komentar pertama (*earliest comment*), status like, total like komentar, dan jumlah post unik yang dikomentari.
+  - Menampilkan waktu komentar pertama, status verifikasi like post, total like komentar, dan jumlah post unik yang dikomentari.
+  - Status like memakai tiga keadaan: `Ya`, `Tidak`, atau `Belum dapat diverifikasi`; kegagalan akses tidak dianggap sebagai `Tidak`.
 - 💬 **Detail Riwayat Komentar per User**:
   - Modal interaktif untuk melihat seluruh kutipan komentar yang dibuat oleh user tertentu.
   - Link langsung untuk membuka postingan target di browser bawaan sistem.
@@ -24,6 +25,7 @@ Dibangun menggunakan kombinasi teknologi berkinerja tinggi: **Tauri v2 (Rust)**,
   - Total postingan yang dipindai, total komentar, rata-rata komentar per post, total post likes, dan *unique commenters*.
 - 📥 **Export ke Excel Otomatis**:
   - Menghasilkan file `.xlsx` dengan format rapi, styling tabel profesional, dan multiple sheet (Ringkasan, Peringkat Top Commenters, serta Semua Riwayat Komentar).
+  - Menyertakan status/sumber pemeriksaan liker, bukti kelengkapan, count yang tidak tersedia, dan peringatan bila hasil parsial.
 - ⚡ **Real-Time Live Monitor**:
   - Live progress bar dan terminal logs bertenaga **WebSocket** dengan mekanisme *Polling Fallback* agar UI tetap responsif.
 
@@ -197,7 +199,11 @@ tauri_scraping_desktop_app/
 
 ## ⚠️ Catatan & Best Practices
 
-- **Instagram Scraping**: Instagram memiliki proteksi *rate limit* yang ketat. Disarankan menggunakan **akun Instagram sekunder / dummy** khusus untuk keperluan scraping, dan hindari melakukan scanning ribuan post dalam waktu berdekatan.
+- **Instagram**: Utamakan Instagram API resmi dan OAuth untuk akun Professional yang Anda kelola. Integrasi web/private dapat berubah atau dibatasi sewaktu-waktu dan tidak menjamin tersedianya daftar liker.
+- **Status like post**: `Belum dapat diverifikasi` berarti daftar liker tidak lengkap/tidak tersedia pada sesi tersebut. Jangan memperlakukannya sebagai `Tidak`, dan lakukan verifikasi manual untuk keputusan final seperti pemenang giveaway.
+- **Like komentar**: Count yang tidak dikirim Instagram ditampilkan sebagai `Tidak tersedia`. Jika hanya sebagian komentar memiliki count, laporan menampilkan subtotal minimum dengan awalan `≥`.
+- **Rate limit dan challenge**: Aplikasi menghentikan pekerjaan pada indikasi autentikasi gagal/pembatasan, memutus lookup setelah tiga kegagalan beruntun, dan membatasi pemeriksaan liker maksimal 20 post per pekerjaan. Pengambilan komentar dibatasi 100 komentar per post dan hasil parsial diberi peringatan. Jangan menjalankan ulang secara bertubi-tubi, memakai rotasi akun/proxy, atau mencoba melewati checkpoint Instagram.
+- **Rahasia sesi**: Password, Cookie Session ID, dan file sesi adalah kredensial sensitif. Jangan membagikannya atau memasukkannya ke source control.
 - **TikTok Scraping**: Menggunakan profil browser Playwright lokal yang tersimpan di folder `.tiktok_browser_profile/` untuk menjaga stabilitas sesi penjelajahan.
 - **Penyimpanan Build Rust (`target/`)**: Folder kompilasi Rust (`frontend/src-tauri/target/`) dapat dibersihkan kapan saja dengan perintah `cargo clean` di folder `src-tauri` jika ingin menghemat ruang disk.
 

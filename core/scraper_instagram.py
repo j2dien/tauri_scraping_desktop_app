@@ -7,6 +7,7 @@ dalam rentang waktu tertentu secara cepat, aman, dan non-blocking.
 
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
@@ -29,11 +30,189 @@ PROFILE_WEB_DOC_ID = "34579740524958711"
 REELS_WEB_DOC_ID = "27234427476213202"
 MEDIA_LIKERS_WEB_DOC_ID = "27928626103504365"
 INSTAGRAM_SNOWFLAKE_EPOCH_MS = 1_314_220_021_721
+LIKER_LOOKUP_FAILURE_LIMIT = 3
+COMMENT_FETCH_FAILURE_LIMIT = 3
+LIKER_LOOKUP_JOB_LIMIT = 20
+COMMENTS_PER_POST_LIMIT = 100
+OEMBED_CAPTION_ENRICH_LIMIT = 10
+OEMBED_REQUEST_INTERVAL_SECONDS = 0.5
+LIKER_BROWSER_MAX_SCROLLS = 6
+LIKER_BROWSER_MIN_INTERVAL_SECONDS = 1.25
 
 
 class LoginRequiredError(Exception):
     """Raised ketika Instagram memblokir akses atau memerlukan interaksi/verifikasi."""
     pass
+
+
+class InstagramRateLimitError(LoginRequiredError):
+    """Raised ketika Instagram meminta pekerjaan dihentikan karena throttling."""
+
+
+class InstagramAuthenticationError(LoginRequiredError):
+    """Raised ketika sesi tidak lagi terautentikasi."""
+
+
+class InstagramCommentFetchError(RuntimeError):
+    """Raised untuk kegagalan per-post non-terminal yang harus dicatat caller."""
+
+
+@dataclass
+class LikerLookupResult:
+    """Hasil lookup liker beserta bukti kelengkapan yang dapat diaudit.
+
+    Daftar liker parsial masih berguna untuk membuktikan status ``Ya``, tetapi
+    tidak pernah cukup untuk menyimpulkan ``Tidak``.
+    """
+
+    usernames: set[str] = field(default_factory=set)
+    user_ids: set[str] = field(default_factory=set)
+    status: str = "unavailable"
+    source: str = "none"
+    reason: str = ""
+    errors: list[str] = field(default_factory=list)
+    expected_count: Optional[int] = None
+    usernames_complete: bool = False
+    user_ids_complete: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete"
+
+    @property
+    def observed_count(self) -> int:
+        # Username dan ID umumnya mewakili user yang sama. ``max`` mencegah
+        # penghitungan ganda tanpa membuang identity yang hanya punya salah satu.
+        return max(len(self.usernames), len(self.user_ids))
+
+    def diagnostics(self) -> dict:
+        return {
+            "ok": self.status in {"complete", "partial"},
+            "status": self.status,
+            "complete": self.complete,
+            "source": self.source,
+            "reason": self.reason,
+            "errors": list(self.errors),
+            "count": self.observed_count,
+            "expected_count": self.expected_count,
+            "usernames_complete": self.usernames_complete,
+            "user_ids_complete": self.user_ids_complete,
+        }
+
+
+def _exception_http_status(exc: BaseException) -> Optional[int]:
+    """Ambil HTTP status dari exception requests/instagrapi tanpa coupling ketat."""
+    for candidate in (exc, getattr(exc, "response", None)):
+        if candidate is None:
+            continue
+        status = getattr(candidate, "status_code", None) or getattr(candidate, "status", None)
+        if status is None:
+            continue
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _classify_instagram_exception(exc: BaseException) -> str:
+    """Klasifikasikan error terminal agar fallback tidak memperparah pembatasan."""
+    if isinstance(exc, InstagramRateLimitError):
+        return "rate_limited"
+    if isinstance(exc, InstagramAuthenticationError):
+        return "unauthenticated"
+
+    status = _exception_http_status(exc)
+    message = f"{type(exc).__name__}: {exc}".lower()
+    if status == 429 or any(
+        marker in message
+        for marker in (
+            "rate limit",
+            "ratelimit",
+            "throttl",
+            "too many requests",
+            "feedback_required",
+            "feedbackrequired",
+            "please wait a few minutes",
+            "pleasewaitfewminutes",
+            "temporarily blocked",
+            "sentry_block",
+            "spam",
+        )
+    ):
+        return "rate_limited"
+    if any(
+        marker in message
+        for marker in ("challenge", "checkpoint", "two_factor", "2fa", "verification required")
+    ):
+        return "unauthenticated"
+    if isinstance(exc, (LoginRequiredError, LoginRequired)) or status in {401, 403} or any(
+        marker in message
+        for marker in (
+            "login_required",
+            "login required",
+            "not logged in",
+            "session expired",
+            "session has expired",
+            "accounts/login",
+        )
+    ):
+        return "unauthenticated"
+    return "error"
+
+
+def _raise_if_terminal_instagram_error(exc: BaseException, action: str) -> None:
+    """Hentikan request lanjutan untuk auth/rate-limit; error biasa boleh fallback."""
+    category = _classify_instagram_exception(exc)
+    if category == "rate_limited":
+        raise InstagramRateLimitError(
+            f"Instagram membatasi permintaan saat {action}. Pekerjaan dihentikan agar pembatasan tidak bertambah; "
+            "tunggu sebelum mencoba kembali."
+        ) from exc
+    if category == "unauthenticated":
+        raise InstagramAuthenticationError(
+            f"Sesi Instagram tidak lagi dapat digunakan saat {action}. Login ulang atau perbarui Cookie Session ID."
+        ) from exc
+
+
+def _optional_count(value: Any) -> Optional[int]:
+    """Normalisasi angka tanpa mengubah nilai yang hilang menjadi nol."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        text = str(value).strip().lower()
+        abbreviated = re.search(
+            r"(-?\d+(?:[.,]\d+)?)\s*(rb|ribu|k|jt|juta|miliar|m|b)\b",
+            text,
+            flags=re.I,
+        )
+        if abbreviated:
+            number_text, suffix = abbreviated.groups()
+            factors = {
+                "rb": 1_000,
+                "ribu": 1_000,
+                "k": 1_000,
+                "jt": 1_000_000,
+                "juta": 1_000_000,
+                "m": 1_000_000,
+                "miliar": 1_000_000_000,
+                "b": 1_000_000_000,
+            }
+            try:
+                number = float(number_text.replace(",", "."))
+                return max(int(number * factors[suffix.lower()]), 0)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        match = re.search(r"-?\d[\d.,]*", text)
+        if not match:
+            return None
+        digits = re.sub(r"\D", "", match.group(0))
+        return int(digits) if digits else None
 
 
 def _no_interactive_challenge(username: str, choice=None):
@@ -109,8 +288,8 @@ def _configure_web_session(cl: Client, sessionid: str, extra_cookies=None) -> st
     return owner_id
 
 
-def _validate_web_session(cl: Client) -> bool:
-    """Validasi cookie melalui GraphQL web yang tidak terkena needs_upgrade."""
+def _validate_web_session(cl: Client, expected_username: str = "") -> bool:
+    """Validasi cookie dan cocokkan identitas viewer dengan pemilik sessionid."""
     sessionid = getattr(cl, "sessionid", "") or ""
     owner_id = _session_user_id(sessionid)
     if not owner_id:
@@ -138,7 +317,28 @@ def _validate_web_session(cl: Client) -> bool:
         return False
 
     viewer_id = str(viewer_user.get("pk") or viewer_user.get("id") or "")
-    return not viewer_id or viewer_id == owner_id
+    viewer_username = str(viewer_user.get("username") or "").strip().lower()
+    setattr(
+        cl,
+        "_instagram_viewer_identity",
+        {"id": viewer_id, "username": viewer_username},
+    )
+
+    # Identitas kosong tidak cukup menjadi bukti login. Prefix sessionid juga
+    # harus sama dengan viewer agar cookie dari akun berbeda tidak tertukar.
+    if not viewer_id or viewer_id != owner_id:
+        return False
+
+    expected = expected_username.replace("@", "").strip().lower()
+    if expected:
+        if not viewer_username:
+            return False
+        if viewer_username != expected:
+            raise InstagramAuthenticationError(
+                f"Cookie Session ID milik @{viewer_username}, bukan @{expected}. "
+                "Gunakan username yang sesuai dengan cookie tersebut."
+            )
+    return True
 
 
 def _login_instagram_web(
@@ -195,6 +395,10 @@ def _login_instagram_web(
         },
         timeout=cl.request_timeout,
     )
+    if response.status_code == 429:
+        raise InstagramRateLimitError(
+            "Instagram membatasi percobaan login (HTTP 429). Hentikan percobaan dan tunggu sebelum mencoba lagi."
+        )
     try:
         result = response.json()
     except ValueError as exc:
@@ -212,6 +416,10 @@ def _login_instagram_web(
         )
     if not result.get("authenticated"):
         message = result.get("message") or result.get("error_type") or "autentikasi ditolak"
+        if _classify_instagram_exception(RuntimeError(str(message))) == "rate_limited":
+            raise InstagramRateLimitError(
+                "Instagram membatasi percobaan login. Hentikan percobaan dan tunggu sebelum mencoba lagi."
+            )
         raise LoginRequiredError(f"Login Instagram Web gagal: {message}")
 
     sessionid = session.cookies.get("sessionid") or ""
@@ -244,7 +452,16 @@ def _enrich_reel_captions_oembed(
     """Isi caption light-media Reels melalui oEmbed publik Instagram."""
     missing = [reel for reel in reels if not (getattr(reel, "caption_text", "") or "").strip()]
     enriched = 0
-    for reel in missing:
+    attempts = 0
+    consecutive_failures = 0
+    last_request_started = 0.0
+    for reel in missing[:OEMBED_CAPTION_ENRICH_LIMIT]:
+        elapsed = time.monotonic() - last_request_started
+        remaining = OEMBED_REQUEST_INTERVAL_SECONDS - elapsed
+        if last_request_started and remaining > 0:
+            time.sleep(remaining)
+        last_request_started = time.monotonic()
+        attempts += 1
         try:
             response = cl.public.get(
                 "https://www.instagram.com/api/v1/oembed/",
@@ -257,12 +474,21 @@ def _enrich_reel_captions_oembed(
             if caption:
                 reel.caption_text = caption
                 enriched += 1
-        except Exception:
-            # Caption tidak boleh menggagalkan pengambilan post dan komentar.
-            continue
+            consecutive_failures = 0
+        except Exception as exc:
+            # Error biasa tidak menggagalkan data utama, tetapi auth/rate-limit
+            # harus menghentikan job agar tidak menambah request yang ditolak.
+            _raise_if_terminal_instagram_error(exc, "melengkapi caption Reels via oEmbed")
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                break
 
     if progress_callback and missing:
-        progress_callback(f"Caption reels: {enriched}/{len(missing)} berhasil dilengkapi via oEmbed.")
+        skipped = max(len(missing) - attempts, 0)
+        suffix = f"; {skipped} dilewati oleh batas keamanan" if skipped else ""
+        progress_callback(
+            f"Caption reels: {enriched}/{attempts} request berhasil dilengkapi via oEmbed{suffix}."
+        )
 
 
 def _media_id(media) -> str:
@@ -611,13 +837,14 @@ def login_by_sessionid(
 ) -> bool:
     """
     Login ke Instagram langsung menggunakan cookie sessionid dari browser.
-    Metode ini bebas dari Challenge / Checkpoint karena menggunakan token web yang sah.
+    Cookie tetap dapat kedaluwarsa, dibatasi, atau memerlukan checkpoint.
     """
     clean_sid = sessionid.strip().strip('"').strip("'")
     if not clean_sid:
         raise LoginRequiredError("Session ID tidak boleh kosong.")
 
     clean_user = username.replace("@", "").strip().lower() if username else "ig_session_user"
+    generic_usernames = {"ig_session_user", "session_user"}
     session_file = _session_path(clean_user)
 
     if progress_callback:
@@ -633,18 +860,27 @@ def login_by_sessionid(
 
     try:
         _configure_web_session(cl, clean_sid)
-        if not _validate_web_session(cl):
+        expected_username = "" if clean_user in generic_usernames else clean_user
+        if not _validate_web_session(cl, expected_username=expected_username):
             raise LoginRequiredError(
                 "Cookie Session ID tidak lagi terautentikasi. Feed/Reels publik masih dapat terlihat tanpa login, "
                 "tetapi status 'Sudah Like Post?' memerlukan sessionid aktif. Salin sessionid terbaru dari browser."
             )
-        cl.dump_settings(session_file)
+        viewer_identity = getattr(cl, "_instagram_viewer_identity", {}) or {}
+        viewer_username = str(viewer_identity.get("username") or "").strip().lower()
+        cl.username = viewer_username or expected_username or clean_user
+        # Jika username tidak diberikan, simpan sesi di bawah identitas yang
+        # diverifikasi alih-alih nama placeholder yang dapat tertukar.
+        verified_session_file = _session_path(viewer_username or clean_user)
+        cl.dump_settings(verified_session_file)
         if progress_callback:
-            progress_callback("✓ Cookie Session ID valid melalui Instagram Web! Sesi telah disimpan.")
+            identity_text = f" sebagai @{viewer_username}" if viewer_username else ""
+            progress_callback(f"✓ Cookie Session ID valid melalui Instagram Web{identity_text}. Sesi telah disimpan.")
         return True
     except LoginRequiredError:
         raise
     except Exception as e:
+        _raise_if_terminal_instagram_error(e, "memvalidasi Cookie Session ID")
         raise LoginRequiredError(
             f"Gagal login menggunakan Session ID: {str(e)}.\n"
             "Pastikan cookie sessionid disalin lengkap dari browser tempat Anda login ke Instagram."
@@ -678,14 +914,32 @@ def login_instagram(
             _sync_web_cookies(cl)
             # Validasi lewat host web agar session browser tidak ditolak oleh
             # endpoint mobile dengan login_required/needs_upgrade.
-            if not _validate_web_session(cl):
+            if not _validate_web_session(cl, expected_username=clean_user):
                 raise LoginRequiredError("Sesi web sudah kedaluwarsa.")
             setattr(cl, "_instagram_web_session", True)
             cl.username = clean_user
             if progress_callback:
                 progress_callback(f"✓ Sesi web @{clean_user} masih valid! Melanjutkan...")
             return True
-        except Exception:
+        except InstagramRateLimitError:
+            raise
+        except Exception as exc:
+            if _classify_instagram_exception(exc) == "rate_limited":
+                _raise_if_terminal_instagram_error(exc, "memvalidasi sesi tersimpan")
+            saved_session_error = f"{type(exc).__name__}: {exc}".lower()
+            if any(
+                marker in saved_session_error
+                for marker in ("challenge", "checkpoint", "two_factor", "2fa", "verification required")
+            ):
+                try:
+                    cl.dump_settings(session_file)
+                except Exception:
+                    pass
+                raise LoginRequiredError(
+                    f"Sesi tersimpan @{clean_user} memerlukan verifikasi keamanan. "
+                    "Konfirmasi 'Ini Saya'/checkpoint di aplikasi Instagram, lalu coba lagi; "
+                    "login password otomatis tidak dilanjutkan agar tidak menambah percobaan."
+                ) from exc
             if progress_callback:
                 progress_callback("Sesi token kedaluwarsa, mempertahankan device settings dan mencoba login ulang...")
             # PENTING: Jangan hapus device settings! Simpan device settings saat ini agar UUID & Device ID tetap sama
@@ -727,13 +981,15 @@ def login_instagram(
                 "Langkah penyelesaian:\n"
                 "1. Buka aplikasi Instagram di ponsel Anda dan konfirmasi 'Ini Saya'.\n"
                 "2. Klik 'Mulai Scraping & Analisis' kembali di aplikasi ini (identitas perangkat telah tersimpan).\n"
-                "💡 Atau gunakan opsi 'Cookie Session ID' dari browser Chrome/Edge untuk bypass challenge 100%."
+                "Atau gunakan Cookie Session ID terbaru dari browser Chrome/Edge yang sudah terautentikasi."
             )
 
         if "bad_password" in err_lower or "password" in err_lower:
             raise LoginRequiredError("Password Instagram yang dimasukkan salah. Periksa kembali password Anda.")
         if "rate" in err_lower or "429" in err_lower or "feedback_required" in err_lower:
-            raise LoginRequiredError("Instagram membatasi permintaan login (Rate Limit). Tunggu 10-15 menit atau gunakan opsi Cookie Session ID.")
+            raise InstagramRateLimitError(
+                "Instagram membatasi permintaan login. Hentikan percobaan dan tunggu sebelum mencoba kembali."
+            )
         raise LoginRequiredError(f"Gagal login Instagram: {err_msg}")
 
 
@@ -903,11 +1159,13 @@ def get_posts_in_range(
         else:
             try:
                 user_id = cl.user_id_from_username(clean_target)
-            except Exception:
+            except Exception as exc:
+                _raise_if_terminal_instagram_error(exc, f"mencari profil @{clean_target}")
                 user_id = _resolve_user_id_web(cl, clean_target)
     except UserNotFound:
         raise LoginRequiredError(f"Profil @{clean_target} tidak ditemukan. Periksa ejaan username target.")
     except (LoginRequired, ClientError) as e:
+        _raise_if_terminal_instagram_error(e, f"mencari profil @{clean_target}")
         raise LoginRequiredError(f"Gagal mengakses profil @{clean_target}: {e}")
 
     filtered_posts = []
@@ -932,6 +1190,7 @@ def get_posts_in_range(
                         f"✓ Ditemukan {len(feed_posts)} postingan grid via GraphQL Web."
                     )
             except Exception as e:
+                _raise_if_terminal_instagram_error(e, "mengambil feed melalui GraphQL Web")
                 if progress_callback:
                     progress_callback(
                         f"GraphQL Web feed gagal ({str(e)[:80]}), mencoba fallback lain..."
@@ -943,6 +1202,7 @@ def get_posts_in_range(
                 if progress_callback:
                     progress_callback(f"✓ Ditemukan {len(feed_posts)} postingan feed dalam rentang tanggal.")
             except Exception as e:
+                _raise_if_terminal_instagram_error(e, "mengambil feed melalui Private API")
                 if progress_callback:
                     progress_callback(f"Private API feed gagal ({str(e)[:80]}), mencoba via GraphQL Web...")
 
@@ -956,6 +1216,7 @@ def get_posts_in_range(
                 if progress_callback:
                     progress_callback(f"✓ Ditemukan {len(feed_posts)} postingan grid via GraphQL Web.")
             except Exception as e:
+                _raise_if_terminal_instagram_error(e, "mengambil fallback feed")
                 if progress_callback:
                     progress_callback(f"⚠ Gagal mengambil feed: {str(e)[:100]}")
 
@@ -970,6 +1231,7 @@ def get_posts_in_range(
                     cl, user_id, start_date, end_date, progress_callback=progress_callback
                 )
             except Exception as e:
+                _raise_if_terminal_instagram_error(e, "mengambil reels melalui Private API")
                 private_reels_error = e
                 if progress_callback:
                     progress_callback(
@@ -990,6 +1252,7 @@ def get_posts_in_range(
                     progress_callback=progress_callback,
                 )
             except Exception as gql_error:
+                _raise_if_terminal_instagram_error(gql_error, "mengambil reels melalui GraphQL Web")
                 if progress_callback:
                     private_info = f"; Private API: {str(private_reels_error)[:60]}" if private_reels_error else ""
                     progress_callback(
@@ -1042,8 +1305,7 @@ def get_posts_in_range(
     except LoginRequired:
         raise LoginRequiredError("Sesi Instagram kedaluwarsa saat mengambil postingan. Silakan coba lagi.")
     except Exception as e:
-        if "login" in str(e).lower() or "401" in str(e):
-            raise LoginRequiredError(f"Instagram membatasi akses: {e}")
+        _raise_if_terminal_instagram_error(e, "mengambil postingan")
         raise
 
     return filtered_posts
@@ -1074,6 +1336,132 @@ def _liker_identity_sets(users) -> tuple[set[str], set[str]]:
     return usernames, user_ids
 
 
+def _liker_connection_nodes(connection: Any) -> list:
+    """Ambil node liker dari dua bentuk connection GraphQL tanpa duplikasi kasar."""
+    if not isinstance(connection, dict):
+        return []
+    nodes = list(connection.get("nodes") or [])
+    nodes.extend(
+        edge.get("node")
+        for edge in (connection.get("edges") or [])
+        if isinstance(edge, dict) and edge.get("node")
+    )
+    return nodes
+
+
+def _liker_connection_total(connection: Any) -> Optional[int]:
+    if not isinstance(connection, dict):
+        return None
+    for key in ("total_count", "count"):
+        if key in connection:
+            parsed = _optional_count(connection.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _liker_result_from_identities(
+    usernames: set[str],
+    user_ids: set[str],
+    *,
+    source: str,
+    expected_count: Optional[int],
+    reached_end: bool = False,
+    connection_total: Optional[int] = None,
+    reason: str = "",
+    errors: Optional[list[str]] = None,
+) -> LikerLookupResult:
+    """Tentukan kelengkapan hanya jika ada bukti eksplisit, bukan karena request sukses."""
+    observed = max(len(usernames), len(user_ids))
+    # ``media.like_count`` tidak dapat dijadikan bukti completeness: nilainya
+    # bisa disembunyikan, stale, atau tidak sejalan dengan dialog. Hanya sinyal
+    # akhir pagination dari connection yang boleh menghasilkan status complete.
+    # Akhir pagination saja belum cukup bila respons tidak memberi total:
+    # sebagian node dapat kehilangan username/ID. Total connection yang cocok
+    # membuktikan setidaknya satu namespace identity benar-benar lengkap.
+    complete = (
+        reached_end
+        and connection_total is not None
+        and observed >= connection_total
+    )
+    usernames_complete = bool(
+        complete and (connection_total == 0 or len(usernames) >= connection_total)
+    )
+    user_ids_complete = bool(
+        complete and (connection_total == 0 or len(user_ids) >= connection_total)
+    )
+
+    if complete:
+        status = "complete"
+        result_reason = reason or "Daftar liker terkonfirmasi lengkap."
+    elif observed:
+        status = "partial"
+        result_reason = reason or "Sebagian liker terbaca, tetapi pagination/total belum terkonfirmasi lengkap."
+    else:
+        status = "unavailable"
+        result_reason = reason or "Instagram tidak memberikan daftar liker yang dapat diverifikasi."
+
+    return LikerLookupResult(
+        usernames=set(usernames),
+        user_ids=set(user_ids),
+        status=status,
+        source=source,
+        reason=result_reason,
+        errors=list(errors or []),
+        expected_count=expected_count,
+        usernames_complete=usernames_complete,
+        user_ids_complete=user_ids_complete,
+    )
+
+
+def _merge_liker_results(
+    results: list[LikerLookupResult],
+    *,
+    source: str,
+    expected_count: Optional[int],
+) -> LikerLookupResult:
+    """Gabungkan identity dari beberapa jalur sambil mempertahankan bukti completeness."""
+    usernames: set[str] = set()
+    user_ids: set[str] = set()
+    errors: list[str] = []
+    reasons: list[str] = []
+    for result in results:
+        usernames.update(result.usernames)
+        user_ids.update(result.user_ids)
+        errors.extend(result.errors)
+        if result.reason and result.reason not in reasons:
+            reasons.append(result.reason)
+
+    complete = any(result.complete for result in results)
+    usernames_complete = any(result.usernames_complete for result in results)
+    user_ids_complete = any(result.user_ids_complete for result in results)
+    observed = max(len(usernames), len(user_ids))
+
+    if complete:
+        status = "complete"
+    elif observed:
+        status = "partial"
+    else:
+        # Pertahankan kategori paling actionable untuk circuit breaker/log.
+        statuses = {result.status for result in results}
+        status = next(
+            (candidate for candidate in ("rate_limited", "unauthenticated", "error", "unavailable") if candidate in statuses),
+            "unavailable",
+        )
+
+    return LikerLookupResult(
+        usernames=usernames,
+        user_ids=user_ids,
+        status=status,
+        source=source,
+        reason="; ".join(reasons) or "Lookup liker tidak menghasilkan data.",
+        errors=list(dict.fromkeys(errors)),
+        expected_count=expected_count,
+        usernames_complete=usernames_complete,
+        user_ids_complete=user_ids_complete,
+    )
+
+
 class _InstagramLikerBrowser:
     """Ambil daftar liker dari dialog web dengan satu browser per pekerjaan.
 
@@ -1089,6 +1477,7 @@ class _InstagramLikerBrowser:
         self.browser = None
         self.context = None
         self.page = None
+        self._last_lookup_started = 0.0
 
     def _start(self) -> None:
         if self.page is not None:
@@ -1096,15 +1485,12 @@ class _InstagramLikerBrowser:
 
         _sync_web_cookies(self.cl)
         self.playwright = sync_playwright().start()
-        launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-        ]
         last_error = None
         for channel in ("msedge", "chrome", None):
             try:
-                options = {"headless": True, "args": launch_args}
+                # Gunakan sandbox dan fingerprint browser normal. Flag untuk
+                # menyembunyikan automation justru rapuh dan meningkatkan risiko.
+                options = {"headless": True}
                 if channel:
                     options["channel"] = channel
                 self.browser = self.playwright.chromium.launch(**options)
@@ -1134,30 +1520,98 @@ class _InstagramLikerBrowser:
             self.context.add_cookies(browser_cookies)
         self.page = self.context.new_page()
 
-    def lookup(self, media) -> tuple[set[str], set[str], bool, str]:
-        """Buka dialog liked_by dan baca node liker dari respons GraphQL-nya."""
+    def _pace(self) -> None:
+        """Batasi navigasi dialog agar satu job tidak membanjiri endpoint liker."""
+        elapsed = time.monotonic() - self._last_lookup_started
+        remaining = LIKER_BROWSER_MIN_INTERVAL_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        self._last_lookup_started = time.monotonic()
+
+    @staticmethod
+    def _dialog_usernames(dialog) -> set[str]:
+        try:
+            profile_hrefs = dialog.locator('a[href^="/"]').evaluate_all(
+                "elements => elements.map(el => el.getAttribute('href') || '')"
+            )
+        except Exception:
+            return set()
+
+        usernames: set[str] = set()
+        for href in profile_hrefs:
+            match = re.fullmatch(r"/([A-Za-z0-9._]+)/?", str(href))
+            if match:
+                usernames.add(match.group(1).lower())
+        return usernames
+
+    @staticmethod
+    def _security_redirect_reason(page_url: Any) -> str:
+        """Kenali halaman login/challenge sebelum melakukan request tambahan."""
+        normalized = str(page_url or "").lower()
+        if "/challenge/" in normalized or "/checkpoint/" in normalized:
+            return "Instagram mengarahkan sesi ke halaman challenge/checkpoint."
+        if "/accounts/login" in normalized:
+            return "Sesi browser diarahkan ke halaman login."
+        return ""
+
+    def lookup(self, media, expected_count: Optional[int] = None) -> LikerLookupResult:
+        """Buka dialog liked_by dengan pagination terbatas dan bukti completeness."""
         try:
             self._start()
+            self._pace()
             # Tampilan /p/ tersedia untuk feed maupun Reel dan memuat kontrol
             # liked_by secara konsisten. URL ekspor tetap mengikuti tipe media.
             post_code = getattr(media, "code", "") or _media_id(media)
             post_url = f"https://www.instagram.com/p/{post_code}/"
-            self.page.goto(post_url, wait_until="domcontentloaded", timeout=45_000)
+            navigation = self.page.goto(post_url, wait_until="domcontentloaded", timeout=45_000)
+            navigation_status = getattr(navigation, "status", None)
+            if navigation_status == 429:
+                return LikerLookupResult(
+                    status="rate_limited",
+                    source="browser_web",
+                    reason="Instagram mengembalikan HTTP 429 pada halaman post.",
+                    expected_count=expected_count,
+                )
+            redirect_reason = self._security_redirect_reason(self.page.url)
+            if navigation_status in {401, 403} or redirect_reason:
+                return LikerLookupResult(
+                    status="unauthenticated",
+                    source="browser_web",
+                    reason=redirect_reason or f"Halaman post mengembalikan HTTP {navigation_status}.",
+                    expected_count=expected_count,
+                )
 
-            liked_by_link = self.page.locator('a[href$="/liked_by/"]')
-            if liked_by_link.count() == 0:
+            # Locator utama harus diberi waktu hydration React. Mengecek count()
+            # tepat setelah domcontentloaded dapat menghasilkan false negative.
+            primary_liked_by_link = self.page.locator('a[href$="/liked_by/"]')
+            try:
+                primary_liked_by_link.first.wait_for(state="attached", timeout=8_000)
+                liked_by_link = primary_liked_by_link
+            except Exception:
                 # Sebagian post memakai anchor ``#`` berteks "4 lainnya"
                 # alih-alih URL /liked_by/. Batasi ke pola numerik agar tidak
                 # salah mengklik "Lihat Postingan Lainnya".
-                liked_by_link = self.page.locator('a[href="#"]').filter(
+                fallback_liked_by_link = self.page.locator('a[href="#"]').filter(
                     has_text=re.compile(r"^\s*\d+\s+(?:lainnya|others)\s*$", re.I)
                 )
-            try:
-                liked_by_link.first.wait_for(state="attached", timeout=10_000)
-            except Exception:
-                if "/accounts/login" in self.page.url:
-                    return set(), set(), False, "browser_session_expired"
-                return set(), set(), False, "hidden_by_instagram"
+                try:
+                    fallback_liked_by_link.first.wait_for(state="attached", timeout=3_000)
+                    liked_by_link = fallback_liked_by_link
+                except Exception:
+                    redirect_reason = self._security_redirect_reason(self.page.url)
+                    if redirect_reason:
+                        return LikerLookupResult(
+                            status="unauthenticated",
+                            source="browser_web",
+                            reason=redirect_reason,
+                            expected_count=expected_count,
+                        )
+                    return LikerLookupResult(
+                        status="unavailable",
+                        source="browser_web",
+                        reason="Kontrol daftar liker tidak tersedia pada tampilan post ini.",
+                        expected_count=expected_count,
+                    )
 
             def is_liker_response(response) -> bool:
                 try:
@@ -1175,52 +1629,169 @@ class _InstagramLikerBrowser:
                 if is_liker_response(response):
                     captured_responses.append(response)
 
+            dom_usernames: set[str] = set()
             self.page.on("response", capture_response)
             try:
                 liked_by_link.first.click()
                 dialog = self.page.locator('[role="dialog"]')
                 dialog.wait_for(state="visible", timeout=10_000)
-                # Beri kesempatan singkat pada respons GraphQL untuk selesai.
-                self.page.wait_for_timeout(1_500)
+                self.page.wait_for_timeout(900)
+
+                stable_rounds = 0
+                previous_observed = -1
+                for _ in range(LIKER_BROWSER_MAX_SCROLLS):
+                    dom_usernames.update(self._dialog_usernames(dialog))
+                    observed = len(dom_usernames) + len(captured_responses)
+                    stable_rounds = stable_rounds + 1 if observed == previous_observed else 0
+                    previous_observed = observed
+                    if stable_rounds >= 2:
+                        break
+
+                    scroll_state = dialog.evaluate(
+                        """root => {
+                            const candidates = [root, ...root.querySelectorAll('div')]
+                                .filter(el => el.scrollHeight > el.clientHeight + 4);
+                            if (!candidates.length) return { moved: false };
+                            const el = candidates.reduce((a, b) =>
+                                a.scrollHeight >= b.scrollHeight ? a : b);
+                            const before = el.scrollTop;
+                            el.scrollTop = el.scrollHeight;
+                            return { moved: el.scrollTop > before };
+                        }"""
+                    )
+                    if not (scroll_state or {}).get("moved") and stable_rounds:
+                        break
+                    # Pagination sengaja diberi jeda dan dibatasi agar tidak
+                    # menghasilkan burst request pada satu post.
+                    self.page.wait_for_timeout(850)
+                dom_usernames.update(self._dialog_usernames(dialog))
+            except Exception:
+                redirect_reason = self._security_redirect_reason(self.page.url)
+                if redirect_reason:
+                    return LikerLookupResult(
+                        usernames=dom_usernames,
+                        status="unauthenticated",
+                        source="browser_web",
+                        reason=redirect_reason,
+                        expected_count=expected_count,
+                    )
+                response_statuses = {
+                    getattr(response, "status", None) for response in captured_responses
+                }
+                if 429 in response_statuses:
+                    return LikerLookupResult(
+                        usernames=dom_usernames,
+                        status="rate_limited",
+                        source="browser_web",
+                        reason="Endpoint liker mengembalikan HTTP 429 saat dialog dibuka.",
+                        expected_count=expected_count,
+                    )
+                denied_status = next(
+                    (status for status in (401, 403) if status in response_statuses),
+                    None,
+                )
+                if denied_status is not None:
+                    return LikerLookupResult(
+                        usernames=dom_usernames,
+                        status="unauthenticated",
+                        source="browser_web",
+                        reason=f"Endpoint liker mengembalikan HTTP {denied_status} saat dialog dibuka.",
+                        expected_count=expected_count,
+                    )
+                raise
             finally:
                 self.page.remove_listener("response", capture_response)
 
-            connection = None
-            if captured_responses:
-                payload = captured_responses[-1].json()
-                media_node = ((payload or {}).get("data") or {}).get("fetch__XDTMediaDict") or {}
-                connection = media_node.get("likers_connection")
+            graphql_nodes = []
+            connection_totals: list[int] = []
+            connection_seen = False
+            reached_end = False
+            response_errors: list[str] = []
+            for response in captured_responses:
+                status_code = getattr(response, "status", None)
+                if status_code == 429:
+                    return LikerLookupResult(
+                        usernames=dom_usernames,
+                        status="rate_limited",
+                        source="browser_web",
+                        reason="Endpoint liker mengembalikan HTTP 429.",
+                        expected_count=expected_count,
+                    )
+                if status_code in {401, 403}:
+                    return LikerLookupResult(
+                        usernames=dom_usernames,
+                        status="unauthenticated",
+                        source="browser_web",
+                        reason=f"Endpoint liker mengembalikan HTTP {status_code}.",
+                        expected_count=expected_count,
+                    )
+                try:
+                    payload = response.json()
+                    media_node = ((payload or {}).get("data") or {}).get("fetch__XDTMediaDict") or {}
+                    connection = media_node.get("likers_connection")
+                    if connection is None:
+                        continue
+                    connection_seen = True
+                    graphql_nodes.extend(_liker_connection_nodes(connection))
+                    total_count = _liker_connection_total(connection)
+                    if total_count is not None:
+                        connection_totals.append(total_count)
+                    page_info = connection.get("page_info") or {}
+                    if page_info.get("has_next_page") is False:
+                        reached_end = True
+                except Exception as exc:
+                    response_errors.append(f"Respons browser tidak dapat dibaca: {type(exc).__name__}")
 
-            if connection is not None:
-                browser_likers = list((connection or {}).get("nodes") or [])
-                for edge in (connection or {}).get("edges") or []:
-                    node = (edge or {}).get("node") if isinstance(edge, dict) else None
-                    if node:
-                        browser_likers.append(node)
+            gql_usernames, gql_user_ids = _liker_identity_sets(graphql_nodes)
+            connection_total = max(connection_totals) if connection_totals else None
+            source = "browser_web" if captured_responses else "browser_dom"
+            if connection_seen:
+                return _liker_result_from_identities(
+                    gql_usernames,
+                    gql_user_ids,
+                    source=source,
+                    expected_count=expected_count,
+                    reached_end=reached_end,
+                    connection_total=connection_total,
+                    errors=response_errors,
+                )
 
-                usernames, user_ids = _liker_identity_sets(browser_likers)
-                if browser_likers:
-                    return usernames, user_ids, True, "browser_web"
+            # DOM hanya dipakai sebagai bukti membership positif. Tanpa
+            # connection/page_info terstruktur, ia tidak pernah membuktikan
+            # bahwa user yang tidak terlihat benar-benar tidak memberi like.
+            if dom_usernames:
+                return LikerLookupResult(
+                    usernames=dom_usernames,
+                    status="partial",
+                    source="browser_dom",
+                    reason="Identity liker terlihat di dialog, tetapi kelengkapan pagination tidak dapat dibuktikan.",
+                    errors=response_errors,
+                    expected_count=expected_count,
+                )
 
-            # Beberapa daftar liker sudah ada di payload halaman sehingga klik
-            # tidak membuat request baru. Ambil username unik dari href profil
-            # yang dirender di dalam dialog.
-            profile_hrefs = dialog.locator('a[href^="/"]').evaluate_all(
-                "elements => elements.map(el => el.getAttribute('href') || '')"
+            if response_errors:
+                return LikerLookupResult(
+                    status="error",
+                    source=source,
+                    reason="Respons daftar liker tidak dapat diproses.",
+                    errors=response_errors,
+                    expected_count=expected_count,
+                )
+            return LikerLookupResult(
+                status="unavailable",
+                source=source,
+                reason="Dialog terbuka tetapi Instagram tidak memberikan identity liker.",
+                expected_count=expected_count,
             )
-            usernames = set()
-            for href in profile_hrefs:
-                match = re.fullmatch(r"/([A-Za-z0-9._]+)/?", str(href))
-                if match:
-                    usernames.add(match.group(1).lower())
-            if usernames:
-                return usernames, set(), True, "browser_dom"
-
-            if connection is None:
-                return set(), set(), False, "hidden_by_instagram"
-            return set(), set(), False, "browser_empty"
         except Exception as exc:
-            return set(), set(), False, f"browser_error:{type(exc).__name__}"
+            category = _classify_instagram_exception(exc)
+            return LikerLookupResult(
+                status=category,
+                source="browser_web",
+                reason=f"Browser lookup gagal ({type(exc).__name__}).",
+                errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
+                expected_count=expected_count,
+            )
 
     def close(self) -> None:
         for resource in (self.page, self.context, self.browser):
@@ -1243,22 +1814,35 @@ class _InstagramLikerBrowser:
 def _get_media_liker_identities(
     cl: Client,
     media,
-    post_likes: int,
+    post_likes: Optional[int],
     liker_browser: Optional[_InstagramLikerBrowser] = None,
-) -> tuple[set[str], set[str], bool, str]:
-    """Ambil liker melalui sesi web, lalu fallback ke endpoint private/mobile.
-
-    Nilai boolean menandakan apakah lookup benar-benar berhasil. Ini penting
-    karena set kosong dapat berarti post memang tidak memiliki like, bukan
-    selalu berarti request gagal.
-    """
+) -> LikerLookupResult:
+    """Ambil liker dengan cache per media dan bukti kelengkapan eksplisit."""
     likes_hidden = bool(getattr(media, "like_and_view_counts_disabled", False))
-    if post_likes <= 0 and not likes_hidden:
-        return set(), set(), True, "no_likes"
-
     media_id = str(getattr(media, "id", "") or getattr(media, "pk", ""))
     media_pk = media_id.split("_", 1)[0]
-    errors = []
+    cache_key = (media_pk, post_likes, likes_hidden)
+    cache = getattr(cl, "_instagram_liker_lookup_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(cl, "_instagram_liker_lookup_cache", cache)
+    cached = cache.get(cache_key)
+    if isinstance(cached, LikerLookupResult):
+        return cached
+
+    if post_likes == 0 and not likes_hidden:
+        # Count media pernah terbukti tidak konsisten pada respons Instagram;
+        # nol menghindarkan request tambahan, tetapi bukan bukti non-membership.
+        result = LikerLookupResult(
+            status="not_checked",
+            source="post_like_count",
+            reason="Jumlah like post bernilai 0, tetapi daftar identity liker tidak diverifikasi.",
+            expected_count=0,
+        )
+        cache[cache_key] = result
+        return result
+
+    attempts: list[LikerLookupResult] = []
 
     # Query lama instagrapi (doc_id 24452425501069647) sudah ditolak Instagram.
     # PolarisPostLikedByListDialogQuery adalah query yang dipakai web Instagram
@@ -1270,38 +1854,69 @@ def _get_media_liker_identities(
             data = cl.public_doc_id_graphql_request(
                 MEDIA_LIKERS_WEB_DOC_ID,
                 {"media_id": media_pk},
-                referer=get_instagram_media_url(media).replace("/reel/", "/reels/"),
+                referer=get_instagram_media_url(media),
                 headers={"X-FB-Friendly-Name": "PolarisPostLikedByListDialogQuery"},
             )
             media_node = (data or {}).get("fetch__XDTMediaDict") or {}
             connection = media_node.get("likers_connection")
             if connection is not None:
-                web_likers = list((connection or {}).get("nodes") or [])
-                for edge in (connection or {}).get("edges") or []:
-                    node = (edge or {}).get("node") if isinstance(edge, dict) else None
-                    if node:
-                        web_likers.append(node)
-
+                web_likers = _liker_connection_nodes(connection)
                 usernames, user_ids = _liker_identity_sets(web_likers)
-                if web_likers:
-                    return usernames, user_ids, True, "web_graphql"
-            errors.append("GraphQL publik tidak memberikan user liker")
+                page_info = connection.get("page_info") or {}
+                attempts.append(
+                    _liker_result_from_identities(
+                        usernames,
+                        user_ids,
+                        source="web_graphql",
+                        expected_count=post_likes,
+                        reached_end=page_info.get("has_next_page") is False,
+                        connection_total=_liker_connection_total(connection),
+                    )
+                )
+            else:
+                attempts.append(
+                    LikerLookupResult(
+                        status="unavailable",
+                        source="web_graphql",
+                        reason="GraphQL Web tidak menyediakan likers_connection.",
+                        expected_count=post_likes,
+                    )
+                )
         except Exception as exc:
-            errors.append(f"GraphQL web: {type(exc).__name__}")
+            _raise_if_terminal_instagram_error(exc, "mengambil daftar liker melalui GraphQL Web")
+            attempts.append(
+                LikerLookupResult(
+                    status="error",
+                    source="web_graphql",
+                    reason="GraphQL Web gagal mengambil daftar liker.",
+                    errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
+                    expected_count=post_likes,
+                )
+            )
+
+        if attempts and attempts[-1].complete:
+            cache[cache_key] = attempts[-1]
+            return attempts[-1]
 
         # Endpoint /api/graphql yang dipakai UI memerlukan token Comet dinamis.
         # Browser dibuka sekali dan digunakan ulang untuk semua post dalam job.
         if liker_browser is not None:
-            usernames, user_ids, ok, source = liker_browser.lookup(media)
-            if ok:
-                return usernames, user_ids, True, source
-            errors.append(source)
-            if source == "hidden_by_instagram":
-                return set(), set(), False, source
+            browser_result = liker_browser.lookup(media, expected_count=post_likes)
+            if browser_result.status == "rate_limited":
+                raise InstagramRateLimitError(browser_result.reason)
+            if browser_result.status == "unauthenticated":
+                raise InstagramAuthenticationError(browser_result.reason)
+            attempts.append(browser_result)
 
         # Jangan lanjut ke endpoint mobile untuk sesi browser: selain pasti
         # ditolak, setiap retry dapat menambah puluhan detik per post.
-        return set(), set(), False, "; ".join(errors)
+        result = _merge_liker_results(
+            attempts,
+            source=" + ".join(dict.fromkeys(item.source for item in attempts)),
+            expected_count=post_likes,
+        )
+        cache[cache_key] = result
+        return result
 
     try:
         # Hindari media_id() lookup tambahan jika owner ID sudah ada di objek.
@@ -1313,13 +1928,35 @@ def _get_media_liker_identities(
 
         private_likers = cl.media_likers(private_media_id)
         usernames, user_ids = _liker_identity_sets(private_likers)
-        if private_likers:
-            return usernames, user_ids, True, "private_api"
-        errors.append("Private API mengembalikan daftar kosong")
+        attempts.append(
+            _liker_result_from_identities(
+                usernames,
+                user_ids,
+                source="private_api",
+                expected_count=post_likes,
+                reason=(
+                    "Private API mengembalikan identity liker, tetapi kelengkapan hanya dapat "
+                    "dipastikan bila jumlahnya cocok dengan total post."
+                    if private_likers
+                    else "Private API mengembalikan daftar kosong tanpa bukti bahwa post tidak memiliki like."
+                ),
+            )
+        )
     except Exception as exc:
-        errors.append(f"Private API: {type(exc).__name__}")
+        _raise_if_terminal_instagram_error(exc, "mengambil daftar liker melalui Private API")
+        attempts.append(
+            LikerLookupResult(
+                status="error",
+                source="private_api",
+                reason="Private API gagal mengambil daftar liker.",
+                errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
+                expected_count=post_likes,
+            )
+        )
 
-    return set(), set(), False, "; ".join(errors)
+    result = _merge_liker_results(attempts, source="private_api", expected_count=post_likes)
+    cache[cache_key] = result
+    return result
 
 
 def get_comments_from_post(
@@ -1327,132 +1964,247 @@ def get_comments_from_post(
     media,
     fetch_likers: bool = True,
     liker_browser: Optional[_InstagramLikerBrowser] = None,
+    liker_skip_reason: str = "",
 ) -> list[dict]:
-    """Ambil komentar dari satu postingan dan periksa status like komentator (Mendukung GraphQL & Private API)."""
+    """Ambil komentar serta status like dengan semantik tri-state yang aman."""
     comments = []
-    setattr(cl, "_last_liker_lookup", {"ok": False, "source": "not_checked", "count": 0})
-    try:
-        caption = getattr(media, 'caption_text', '') or ''
-        post_likes = getattr(media, 'like_count', 0) or 0
-        post_code = getattr(media, 'code', '') or str(getattr(media, 'id', ''))
-        post_url = get_instagram_media_url(media)
-        taken_at_str = media.taken_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(media, 'taken_at') and media.taken_at else "N/A"
-        media_id = str(getattr(media, 'id', '')) or str(getattr(media, 'pk', ''))
+    setattr(
+        cl,
+        "_last_liker_lookup",
+        LikerLookupResult(status="not_checked", source="not_checked", reason="Belum diperiksa.").diagnostics(),
+    )
+    caption = getattr(media, "caption_text", "") or ""
+    post_likes = _optional_count(getattr(media, "like_count", None))
+    post_code = getattr(media, "code", "") or str(getattr(media, "id", ""))
+    post_url = get_instagram_media_url(media)
+    taken_at = getattr(media, "taken_at", None)
+    taken_at_str = taken_at.strftime("%Y-%m-%d %H:%M:%S") if taken_at else "N/A"
+    media_id = str(getattr(media, "id", "") or getattr(media, "pk", ""))
+    expected_comment_count = _optional_count(getattr(media, "comment_count", None))
 
-        media_comments = []
-
-        # 1. Coba ambil via GraphQL Web API terlebih dahulu (sangat stabil untuk sesi web / Cookie Session ID)
+    media_comments = []
+    comment_errors: list[str] = []
+    successful_comment_request = False
+    comment_source = "none"
+    # Endpoint kosong belum tentu error (post memang dapat tidak memiliki
+    # komentar), sehingga fallback dicoba tanpa menghapus diagnostik error.
+    comment_methods = [("graphql", getattr(cl, "media_comments_gql", None))]
+    if not getattr(cl, "_instagram_web_session", False):
+        comment_methods.append(("private_api", getattr(cl, "media_comments", None)))
+    for source, method in comment_methods:
+        if not callable(method):
+            comment_errors.append(f"{source}: method tidak tersedia")
+            continue
         try:
-            media_comments = cl.media_comments_gql(media_id, amount=100)
-        except Exception:
-            pass
+            candidate_comments = method(media_id, amount=COMMENTS_PER_POST_LIMIT) or []
+            successful_comment_request = True
+            if candidate_comments:
+                media_comments = list(candidate_comments)
+                comment_source = source
+                break
+            comment_source = source
+            # Respons kosong adalah hasil final bila metadata juga nol/tidak
+            # tersedia. Fallback tambahan hanya layak bila ada bukti komentar.
+            if expected_comment_count in {None, 0}:
+                break
+        except Exception as exc:
+            _raise_if_terminal_instagram_error(exc, f"mengambil komentar post {post_code}")
+            comment_errors.append(f"{source}: {type(exc).__name__}: {str(exc)[:160]}")
 
-        # 2. Fallback: Coba via Private API v1 jika GraphQL belum menghasilkan data
-        if not media_comments:
-            try:
-                media_comments = cl.media_comments(media_id, amount=100)
-            except Exception:
-                pass
-
-        # 3. Fallback kedua: Coba via Threaded GraphQL
-        if not media_comments:
-            try:
-                media_comments = cl.media_comments_threaded_gql(media_id, amount=100)
-            except Exception:
-                pass
-
-        if not media_comments:
-            setattr(cl, "_last_liker_lookup", {"ok": True, "source": "no_comments", "count": 0})
-            return []
-
-        # Ambil daftar liker tanpa menggagalkan data komentar jika Instagram
-        # sedang membatasi endpoint tersebut.
-        liker_usernames: set[str] = set()
-        liker_user_ids: set[str] = set()
-        liker_lookup_ok = False
-        liker_source = "disabled"
-        if fetch_likers:
-            liker_usernames, liker_user_ids, liker_lookup_ok, liker_source = _get_media_liker_identities(
-                cl, media, int(post_likes), liker_browser=liker_browser
+    if not media_comments:
+        expected_comments_missing = bool(expected_comment_count and expected_comment_count > 0)
+        if not successful_comment_request or expected_comments_missing:
+            setattr(cl, "_last_comment_lookup", {"ok": False, "source": "none", "errors": comment_errors})
+            count_detail = (
+                f"; metadata post menyebut {expected_comment_count} komentar tetapi endpoint mengembalikan kosong"
+                if expected_comments_missing
+                else ""
             )
-
+            error_detail = "; ".join(comment_errors) or "endpoint mengembalikan data kosong"
+            raise InstagramCommentFetchError(
+                f"Komentar tidak dapat diverifikasi untuk post {post_code}{count_detail}: "
+                + error_detail
+            )
+        no_comment_lookup = LikerLookupResult(
+            status="not_checked",
+            source="no_comments",
+            reason="Tidak ada komentar sehingga daftar liker tidak diminta.",
+            expected_count=post_likes,
+        )
+        diagnostics = no_comment_lookup.diagnostics()
+        diagnostics["post_url"] = post_url
+        setattr(cl, "_last_liker_lookup", diagnostics)
         setattr(
             cl,
-            "_last_liker_lookup",
+            "_last_comment_lookup",
             {
-                "ok": liker_lookup_ok,
-                "source": liker_source,
-                "count": max(len(liker_usernames), len(liker_user_ids)),
-                "post_url": post_url,
+                "ok": True,
+                "source": comment_source or "empty",
+                "status": "complete" if expected_comment_count == 0 else "unknown",
+                "complete": expected_comment_count == 0,
+                "expected_count": expected_comment_count,
+                "observed_count": 0,
+                "reason": (
+                    "Metadata post memastikan tidak ada komentar."
+                    if expected_comment_count == 0
+                    else "Endpoint mengembalikan kosong dan metadata total komentar tidak tersedia."
+                ),
+                "errors": comment_errors,
             },
         )
+        return []
 
-        for comment in media_comments:
-            # Parsing data komentar, menangani baik bentuk dict (GraphQL) maupun objek Comment (Private API)
-            if isinstance(comment, dict):
-                user_obj = comment.get("user") or {}
-                if isinstance(user_obj, dict):
-                    commenter_user = user_obj.get("username") or user_obj.get("id") or "unknown"
-                    commenter_user_id = str(user_obj.get("pk") or user_obj.get("id") or "")
-                else:
-                    commenter_user = getattr(user_obj, "username", "unknown")
-                    commenter_user_id = str(
-                        getattr(user_obj, "pk", None) or getattr(user_obj, "id", None) or ""
-                    )
+    observed_comment_count = len(media_comments)
+    if expected_comment_count is None:
+        comment_lookup_status = "unknown"
+        comment_lookup_complete = None
+        comment_lookup_reason = "Jumlah komentar total tidak tersedia untuk membuktikan kelengkapan."
+    elif observed_comment_count >= expected_comment_count:
+        comment_lookup_status = "complete"
+        comment_lookup_complete = True
+        comment_lookup_reason = "Jumlah komentar terbaca memenuhi metadata total post."
+    else:
+        comment_lookup_status = "partial"
+        comment_lookup_complete = False
+        comment_lookup_reason = (
+            f"{observed_comment_count}/{expected_comment_count} komentar terbaca; "
+            f"pengambilan dibatasi {COMMENTS_PER_POST_LIMIT} komentar per post."
+        )
+    setattr(
+        cl,
+        "_last_comment_lookup",
+        {
+            "ok": True,
+            "source": comment_source,
+            "status": comment_lookup_status,
+            "complete": comment_lookup_complete,
+            "expected_count": expected_comment_count,
+            "observed_count": observed_comment_count,
+            "reason": comment_lookup_reason,
+            "errors": comment_errors,
+        },
+    )
 
-                comment_text = comment.get("text") or comment.get("caption") or ""
-                c_likes = comment.get("comment_like_count") or comment.get("like_count") or 0
-                c_ts = comment.get("created_at") or comment.get("created_at_utc")
-                if c_ts:
-                    try:
-                        comment_date = datetime.fromtimestamp(int(c_ts)).strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        comment_date = str(c_ts)
-                else:
-                    comment_date = "N/A"
+    if fetch_likers:
+        liker_result = _get_media_liker_identities(
+            cl, media, post_likes, liker_browser=liker_browser
+        )
+    else:
+        liker_result = LikerLookupResult(
+            status="not_checked",
+            source="circuit_breaker" if liker_skip_reason else "disabled",
+            reason=liker_skip_reason or "Pemeriksaan liker dinonaktifkan.",
+            expected_count=post_likes,
+        )
+
+    diagnostics = liker_result.diagnostics()
+    diagnostics["post_url"] = post_url
+    setattr(cl, "_last_liker_lookup", diagnostics)
+
+    for comment in media_comments:
+        # Parsing data komentar, menangani dict GraphQL maupun objek Comment.
+        if isinstance(comment, dict):
+            user_obj = comment.get("user") or {}
+            if isinstance(user_obj, dict):
+                raw_commenter_username = user_obj.get("username")
+                commenter_user = raw_commenter_username or user_obj.get("id") or "unknown"
+                commenter_user_id = str(user_obj.get("pk") or user_obj.get("id") or "")
             else:
-                user_obj = getattr(comment, 'user', None)
-                commenter_user = getattr(user_obj, 'username', 'unknown') if user_obj else "unknown"
+                raw_commenter_username = getattr(user_obj, "username", None)
+                commenter_user = raw_commenter_username or "unknown"
                 commenter_user_id = str(
                     getattr(user_obj, "pk", None) or getattr(user_obj, "id", None) or ""
-                ) if user_obj else ""
-                comment_text = getattr(comment, 'text', '') or ""
-                comment_date = "N/A"
-                if hasattr(comment, 'created_at_utc') and comment.created_at_utc:
-                    comment_date = comment.created_at_utc.strftime("%Y-%m-%d %H:%M:%S")
-                elif hasattr(comment, 'created_at') and comment.created_at:
-                    comment_date = comment.created_at.strftime("%Y-%m-%d %H:%M:%S")
-                # FIX: Gunakan c_likes (bukan comment_likes) agar konsisten dengan dict output
-                c_likes = getattr(comment, 'like_count', 0) or getattr(comment, 'like_count_display', 0) or 0
+                )
 
-            # Periksa apakah komentator me-like post
-            if liker_lookup_ok:
-                commenter_username_key = str(commenter_user).strip().lower()
-                has_liked = "Ya" if (
-                    commenter_username_key in liker_usernames
-                    or (commenter_user_id and commenter_user_id in liker_user_ids)
-                ) else "Tidak"
-            elif liker_source == "hidden_by_instagram":
-                has_liked = "Disembunyikan Instagram"
+            comment_text = comment.get("text") or comment.get("caption") or ""
+            if "comment_like_count" in comment:
+                raw_comment_likes = comment.get("comment_like_count")
+            elif "like_count" in comment:
+                raw_comment_likes = comment.get("like_count")
             else:
-                has_liked = "Tidak dapat dicek"
+                raw_comment_likes = None
+            c_likes = _optional_count(raw_comment_likes)
+            c_ts = comment.get("created_at") or comment.get("created_at_utc")
+        else:
+            user_obj = getattr(comment, "user", None)
+            raw_commenter_username = getattr(user_obj, "username", None) if user_obj else None
+            commenter_user = raw_commenter_username or "unknown"
+            commenter_user_id = str(
+                getattr(user_obj, "pk", None) or getattr(user_obj, "id", None) or ""
+            ) if user_obj else ""
+            comment_text = getattr(comment, "text", "") or ""
+            c_ts = getattr(comment, "created_at_utc", None) or getattr(comment, "created_at", None)
+            raw_comment_likes = getattr(comment, "like_count", None)
+            if raw_comment_likes is None:
+                raw_comment_likes = getattr(comment, "like_count_display", None)
+            c_likes = _optional_count(raw_comment_likes)
 
-            comment_data = {
-                "commenter_username": commenter_user,
-                "comment_text": comment_text,
-                "has_liked_post": has_liked,
-                "comment_likes": int(c_likes) if c_likes else 0,
-                "comment_date": comment_date,
-                "post_shortcode": post_code,
-                "post_url": post_url,
-                "post_likes": post_likes,
-                "post_date": taken_at_str,
-                "post_caption": (caption[:100] + "...") if caption and len(caption) > 100 else caption,
-            }
-            comments.append(comment_data)
+        if isinstance(c_ts, datetime):
+            comment_date = c_ts.strftime("%Y-%m-%d %H:%M:%S")
+        elif c_ts:
+            try:
+                comment_date = datetime.fromtimestamp(int(c_ts)).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OSError, OverflowError):
+                comment_date = str(c_ts)
+        else:
+            comment_date = "N/A"
 
-    except Exception:
-        pass
+        commenter_user = str(commenter_user or "unknown").strip() or "unknown"
+        commenter_username_key = commenter_user.lower()
+        identity_matched = (
+            commenter_username_key in liker_result.usernames
+            or bool(commenter_user_id and commenter_user_id in liker_result.user_ids)
+        )
+        commenter_has_username = bool(str(raw_commenter_username or "").strip())
+        commenter_has_user_id = bool(commenter_user_id)
+        identity_comparable = (
+            (commenter_has_username and liker_result.usernames_complete)
+            or (commenter_has_user_id and liker_result.user_ids_complete)
+            or (
+                liker_result.complete
+                and liker_result.observed_count == 0
+                and (commenter_has_username or commenter_has_user_id)
+            )
+        )
+        if identity_matched:
+            # Membership positif tetap valid walau daftar baru parsial.
+            has_liked = "Ya"
+        elif liker_result.complete and identity_comparable:
+            has_liked = "Tidak"
+        else:
+            has_liked = "Belum dapat diverifikasi"
+
+        like_lookup_reason = liker_result.reason
+        if liker_result.complete and not identity_matched and not identity_comparable:
+            like_lookup_reason = (
+                f"{like_lookup_reason} Identity komentar tidak tersedia dalam namespace "
+                "username/ID yang terbukti lengkap."
+            ).strip()
+
+        comment_data = {
+            "commenter_username": commenter_user,
+            "comment_text": comment_text,
+            "has_liked_post": has_liked,
+            "comment_likes": c_likes,
+            "comment_date": comment_date,
+            "post_shortcode": post_code,
+            "post_url": post_url,
+            "post_likes": post_likes,
+            "post_date": taken_at_str,
+            "post_caption": (caption[:100] + "...") if caption and len(caption) > 100 else caption,
+            "comment_lookup_status": comment_lookup_status,
+            "comment_lookup_reason": comment_lookup_reason,
+            "post_comment_count_expected": expected_comment_count,
+            "post_comment_count_observed": observed_comment_count,
+            "like_lookup_status": liker_result.status,
+            "like_lookup_source": liker_result.source,
+            "like_lookup_reason": like_lookup_reason,
+            "liker_count_observed": liker_result.observed_count,
+            "liker_lookup_complete": liker_result.complete,
+            "liker_usernames_complete": liker_result.usernames_complete,
+            "liker_user_ids_complete": liker_result.user_ids_complete,
+        }
+        comments.append(comment_data)
 
     return comments
 
@@ -1470,6 +2222,23 @@ def get_all_comments(
         if getattr(cl, "_instagram_web_session", False)
         else None
     )
+    consecutive_liker_failures = 0
+    consecutive_comment_failures = 0
+    liker_lookup_attempts = 0
+    liker_circuit_reason = ""
+    job_diagnostics = {
+        "comment_errors": [],
+        "comment_truncations": [],
+        "comment_unknowns": [],
+        "comments_per_post_limit": COMMENTS_PER_POST_LIMIT,
+        "comment_circuit_open": False,
+        "comment_circuit_reason": "",
+        "liker_circuit_open": False,
+        "liker_circuit_reason": "",
+        "liker_lookup_attempts": 0,
+        "liker_lookup_limit": LIKER_LOOKUP_JOB_LIMIT,
+    }
+    setattr(cl, "_instagram_job_diagnostics", job_diagnostics)
 
     try:
         for i, media in enumerate(posts):
@@ -1486,22 +2255,129 @@ def get_all_comments(
                     f"Mengambil komentar post {i+1}/{total} (ID: {post_code}, {post_date})..."
                 )
 
-            comments = get_comments_from_post(cl, media, liker_browser=liker_browser)
+            if not liker_circuit_reason and liker_lookup_attempts >= LIKER_LOOKUP_JOB_LIMIT:
+                liker_circuit_reason = (
+                    f"Pemeriksaan liker dibatasi maksimal {LIKER_LOOKUP_JOB_LIMIT} post per pekerjaan "
+                    "untuk mengurangi request berulang ke Instagram."
+                )
+                job_diagnostics["liker_circuit_open"] = True
+                job_diagnostics["liker_circuit_reason"] = liker_circuit_reason
+                if liker_browser is not None:
+                    liker_browser.close()
+                    liker_browser = None
+
+            fetch_likers_for_post = not bool(liker_circuit_reason)
+            try:
+                comments = get_comments_from_post(
+                    cl,
+                    media,
+                    fetch_likers=fetch_likers_for_post,
+                    liker_browser=liker_browser,
+                    liker_skip_reason=liker_circuit_reason,
+                )
+            except InstagramCommentFetchError as exc:
+                consecutive_comment_failures += 1
+                error_item = {"post": str(post_code), "error": str(exc)}
+                job_diagnostics["comment_errors"].append(error_item)
+                if consecutive_comment_failures >= COMMENT_FETCH_FAILURE_LIMIT:
+                    circuit_reason = (
+                        f"Pengambilan komentar dihentikan setelah {consecutive_comment_failures} kegagalan beruntun "
+                        "untuk mencegah request berulang ke Instagram."
+                    )
+                    job_diagnostics["comment_circuit_open"] = True
+                    job_diagnostics["comment_circuit_reason"] = circuit_reason
+                    if progress_callback:
+                        progress_callback(
+                            i + 1,
+                            total,
+                            media,
+                            len(all_comments),
+                            circuit_reason,
+                        )
+                    break
+                if progress_callback:
+                    progress_callback(
+                        i + 1,
+                        total,
+                        media,
+                        len(all_comments),
+                        f"Post {i+1}/{total} dilewati: komentar tidak dapat diambil ({str(exc)[:160]}).",
+                    )
+                continue
+            consecutive_comment_failures = 0
             all_comments.extend(comments)
 
+            comment_lookup = getattr(cl, "_last_comment_lookup", {}) or {}
+            comment_message = ""
+            if comment_lookup.get("status") == "partial":
+                truncation = {
+                    "post": str(post_code),
+                    "expected_count": comment_lookup.get("expected_count"),
+                    "observed_count": comment_lookup.get("observed_count"),
+                    "reason": comment_lookup.get("reason"),
+                }
+                job_diagnostics["comment_truncations"].append(truncation)
+                comment_message = (
+                    f"; komentar parsial {comment_lookup.get('observed_count', 0)}/"
+                    f"{comment_lookup.get('expected_count', '?')} terbaca"
+                )
+            elif comment_lookup.get("status") == "unknown":
+                unknown_item = {
+                    "post": str(post_code),
+                    "observed_count": comment_lookup.get("observed_count"),
+                    "reason": comment_lookup.get("reason"),
+                }
+                job_diagnostics["comment_unknowns"].append(unknown_item)
+                comment_message = "; kelengkapan komentar tidak dapat diverifikasi"
+
             liker_lookup = getattr(cl, "_last_liker_lookup", {}) or {}
-            if liker_lookup.get("ok"):
-                if liker_lookup.get("source") == "no_comments":
-                    liker_message = "; tidak ada komentar untuk diperiksa"
-                else:
-                    liker_message = (
-                        f"; status like via {liker_lookup.get('source')} "
-                        f"({liker_lookup.get('count', 0)} liker terbaca)"
-                    )
-            elif liker_lookup.get("source") == "hidden_by_instagram":
-                liker_message = "; daftar liker disembunyikan oleh pemilik post di Instagram"
+            lookup_status = str(liker_lookup.get("status") or "unavailable")
+            lookup_source = str(liker_lookup.get("source") or "")
+            if fetch_likers_for_post and lookup_source not in {
+                "no_comments",
+                "post_like_count",
+                "not_checked",
+                "disabled",
+                "circuit_breaker",
+            }:
+                liker_lookup_attempts += 1
+                job_diagnostics["liker_lookup_attempts"] = liker_lookup_attempts
+            if lookup_status == "complete":
+                consecutive_liker_failures = 0
+                liker_message = (
+                    f"; daftar liker lengkap via {liker_lookup.get('source')} "
+                    f"({liker_lookup.get('count', 0)} liker terbaca)"
+                )
+            elif lookup_status == "partial":
+                consecutive_liker_failures = 0
+                liker_message = (
+                    f"; daftar liker parsial via {liker_lookup.get('source')} "
+                    f"({liker_lookup.get('count', 0)} terbaca; hasil negatif tidak disimpulkan)"
+                )
+            elif lookup_status == "not_checked" and liker_lookup.get("source") == "no_comments":
+                liker_message = "; tidak ada komentar untuk diperiksa"
+            elif lookup_status == "not_checked" and liker_lookup.get("source") == "post_like_count":
+                liker_message = "; jumlah like post 0, tetapi daftar identity tidak diverifikasi"
+            elif lookup_status == "not_checked":
+                liker_message = "; pemeriksaan liker dilewati karena circuit breaker"
             else:
-                liker_message = "; status like tidak dapat dicek oleh Instagram"
+                consecutive_liker_failures += 1
+                liker_message = (
+                    f"; daftar liker belum dapat diverifikasi ({lookup_status}: "
+                    f"{str(liker_lookup.get('reason') or 'tanpa detail')[:120]})"
+                )
+
+                if consecutive_liker_failures >= LIKER_LOOKUP_FAILURE_LIMIT and not liker_circuit_reason:
+                    liker_circuit_reason = (
+                        f"Pemeriksaan liker dihentikan setelah {consecutive_liker_failures} kegagalan beruntun "
+                        "untuk mencegah request berulang."
+                    )
+                    job_diagnostics["liker_circuit_open"] = True
+                    job_diagnostics["liker_circuit_reason"] = liker_circuit_reason
+                    liker_message += f"; {liker_circuit_reason}"
+                    if liker_browser is not None:
+                        liker_browser.close()
+                        liker_browser = None
 
             # Notifikasi setelah postingan selesai diproses
             if progress_callback:
@@ -1511,7 +2387,7 @@ def get_all_comments(
                     media,
                     len(all_comments),
                     f"Post {i+1}/{total} selesai: +{len(comments)} komentar "
-                    f"(Total: {len(all_comments)}){liker_message}"
+                    f"(Total: {len(all_comments)}){comment_message}{liker_message}"
                 )
     finally:
         if liker_browser is not None:

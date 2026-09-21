@@ -29,12 +29,82 @@ BULAN_INDONESIA = [
 
 
 def clean_cell_value(val: Any) -> Any:
-    """Membersihkan nilai sel dari karakter ilegal openpyxl."""
+    """Bersihkan karakter ilegal dan cegah teks user dieksekusi sebagai formula."""
     if val is None:
         return ""
     if isinstance(val, str):
-        return ILLEGAL_CHARACTERS_RE.sub("", val)
+        cleaned = ILLEGAL_CHARACTERS_RE.sub("", val)
+        formula_candidate = cleaned.lstrip()
+        if formula_candidate.startswith(("=", "+", "-", "@")):
+            return f"'{cleaned}"
+        return cleaned
     return val
+
+
+def _optional_count_for_excel(value: Any) -> Any:
+    """Bedakan angka nol yang sah dari count yang tidak dikirim platform."""
+    return "Tidak tersedia" if value is None else clean_cell_value(value)
+
+
+def _lookup_status_for_excel(value: Any) -> str:
+    """Terjemahkan status diagnostik internal menjadi label yang mudah dibaca."""
+    labels = {
+        "complete": "Lengkap",
+        "partial": "Sebagian",
+        "unavailable": "Tidak tersedia",
+        "unauthenticated": "Sesi tidak terautentikasi",
+        "rate_limited": "Dibatasi Instagram",
+        "error": "Gagal diperiksa",
+        "not_checked": "Belum diperiksa",
+        "no_likes": "Lengkap (tidak ada like)",
+        "no_comments": "Tidak ada komentar",
+    }
+    key = str(value or "not_checked").strip().lower()
+    return labels.get(key, clean_cell_value(value or "Belum diperiksa"))
+
+
+def _comment_like_total_for_excel(commenter: dict) -> Any:
+    """Tampilkan subtotal secara eksplisit bila sebagian count tidak tersedia."""
+    total = commenter.get("total_comment_likes")
+    unknown = int(commenter.get("comment_likes_unknown_count") or 0)
+    if total is None:
+        return "Tidak tersedia"
+    if unknown > 0:
+        return f"≥{total} ({unknown} komentar tidak tersedia)"
+    return clean_cell_value(total)
+
+
+def _post_like_total_for_excel(record: dict) -> Any:
+    """Tampilkan subtotal like post tanpa menyamarkan post yang count-nya hilang."""
+    total = record.get("total_post_likes")
+    unknown = int(record.get("post_likes_unknown_count") or 0)
+    if total is None:
+        return "Tidak tersedia"
+    if unknown > 0:
+        return f"≥{total} ({unknown} post tidak tersedia)"
+    return clean_cell_value(total)
+
+
+def _summary_post_metric_for_excel(summary: dict, key: str) -> Any:
+    value = summary.get(key)
+    unknown = int(summary.get("post_likes_unknown_count") or 0)
+    if value is None:
+        return "Tidak tersedia"
+    if unknown > 0:
+        return f"≥{value} ({unknown} post tidak tersedia)"
+    return clean_cell_value(value)
+
+
+def _count_sort_value(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else -1
+
+
+def _boolean_for_excel(value: Any) -> str:
+    if value is True:
+        return "Ya"
+    if value is False:
+        return "Tidak"
+    return "Tidak diketahui"
 
 
 def format_tanggal_indonesia(date_str: str) -> str:
@@ -136,6 +206,7 @@ def export_to_excel(
     filename: str | None = None,
     all_comments: list[dict] | None = None,
     scraped_posts: list[dict] | None = None,
+    analysis_diagnostics: dict | None = None,
 ) -> str:
     """Export data top commenters dan likes ke file Excel."""
     # Normalisasi detail_comments jika dikirim dalam bentuk dictionary
@@ -168,13 +239,13 @@ def export_to_excel(
     ws_summary.title = "Summary"
 
     # Info header
-    ws_summary.merge_cells("A1:F1")
+    ws_summary.merge_cells("A1:K1")
     title_cell = ws_summary["A1"]
     title_cell.value = clean_cell_value(f"Top Commenters & Likes Analysis ({platform}) — @{target_username}")
     title_cell.font = Font(name="Calibri", bold=True, size=14, color="1F4E79")
     title_cell.alignment = Alignment(horizontal="center")
 
-    ws_summary.merge_cells("A2:F2")
+    ws_summary.merge_cells("A2:K2")
     ws_summary["A2"].value = clean_cell_value(f"Periode: {start_date} s/d {end_date}")
     ws_summary["A2"].font = Font(name="Calibri", size=11, italic=True)
     ws_summary["A2"].alignment = Alignment(horizontal="center")
@@ -183,8 +254,8 @@ def export_to_excel(
     stats_start_row = 4
     stats_data = [
         ("Total Post di-scan", summary_stats.get("total_posts_scanned", 0)),
-        ("Total Likes Postingan", summary_stats.get("total_post_likes", 0)),
-        ("Rata-rata Likes/Post", summary_stats.get("avg_likes_per_post", 0)),
+        ("Total Likes Postingan", _summary_post_metric_for_excel(summary_stats, "total_post_likes")),
+        ("Rata-rata Likes/Post", _summary_post_metric_for_excel(summary_stats, "avg_likes_per_post")),
         ("Total Komentar", summary_stats.get("total_comments", 0)),
         ("Unique Commenters", summary_stats.get("unique_commenters", 0)),
         ("Rata-rata Komentar/Post", summary_stats.get("avg_comments_per_post", 0)),
@@ -202,6 +273,8 @@ def export_to_excel(
         "Jumlah Komentar",
         "Komentar Pertama",
         "Sudah Like Post?",
+        "Post Terverifikasi",
+        "Post Belum Diverifikasi",
         "Total Like Postingan",
         "Total Like Komentar",
         "Jumlah Post Dikomen",
@@ -224,29 +297,84 @@ def export_to_excel(
         else:
             urls_str = str(post_urls or "")
 
-        ws_summary.cell(row=row, column=1, value=commenter.get("rank", i + 1))
+        ws_summary.cell(row=row, column=1, value=clean_cell_value(commenter.get("rank", i + 1)))
         ws_summary.cell(row=row, column=2, value=clean_cell_value(commenter.get("username", "unknown")))
-        ws_summary.cell(row=row, column=3, value=commenter.get("comment_count", 0))
+        ws_summary.cell(row=row, column=3, value=clean_cell_value(commenter.get("comment_count", 0)))
         ws_summary.cell(row=row, column=4, value=clean_cell_value(format_tanggal_indonesia(commenter.get("earliest_comment_date", "N/A"))))
         ws_summary.cell(row=row, column=5, value=clean_cell_value(commenter.get("has_liked_post", "N/A")))
-        ws_summary.cell(row=row, column=6, value=commenter.get("total_post_likes", 0))
-        ws_summary.cell(row=row, column=7, value=commenter.get("total_comment_likes", 0))
-        ws_summary.cell(row=row, column=8, value=commenter.get("unique_posts_count", 0))
+        ws_summary.cell(row=row, column=6, value=clean_cell_value(commenter.get("checkable_posts_count", 0)))
+        ws_summary.cell(row=row, column=7, value=clean_cell_value(commenter.get("unknown_posts_count", 0)))
+        ws_summary.cell(row=row, column=8, value=clean_cell_value(_post_like_total_for_excel(commenter)))
+        ws_summary.cell(row=row, column=9, value=clean_cell_value(_comment_like_total_for_excel(commenter)))
+        ws_summary.cell(row=row, column=10, value=clean_cell_value(commenter.get("unique_posts_count", 0)))
         
-        url_cell = ws_summary.cell(row=row, column=9, value=clean_cell_value(urls_str))
+        url_cell = ws_summary.cell(row=row, column=11, value=clean_cell_value(urls_str))
         url_cell.alignment = Alignment(wrap_text=True)
 
         if i % 2 == 1:
-            for col in range(1, 10):
+            for col in range(1, 12):
                 ws_summary.cell(row=row, column=col).fill = data_fill_even
 
+    note_row = table_start_row + len(top_commenters) + 2
     if platform.lower() == "tiktok":
-        note_row = table_start_row + len(top_commenters) + 2
         ws_summary.cell(
             row=note_row,
             column=1,
             value="* Catatan TikTok: Data status like per user bersifat privat di platform TikTok (kolom bernilai N/A)."
         ).font = Font(name="Calibri", italic=True, size=9, color="7F7F7F")
+        note_row += 1
+
+    diagnostics = analysis_diagnostics or {}
+    comment_errors = diagnostics.get("comment_errors")
+    if isinstance(comment_errors, list) and comment_errors:
+        ws_summary.cell(
+            row=note_row,
+            column=1,
+            value=(
+                f"* PERINGATAN: Hasil komentar parsial; {len(comment_errors)} post tidak dapat diambil. "
+                "Periksa log aplikasi sebelum memakai peringkat sebagai hasil final."
+            ),
+        ).font = Font(name="Calibri", italic=True, size=9, color="C00000")
+        note_row += 1
+
+    comment_truncations = diagnostics.get("comment_truncations")
+    if isinstance(comment_truncations, list) and comment_truncations:
+        comments_per_post_limit = diagnostics.get("comments_per_post_limit") or 100
+        ws_summary.cell(
+            row=note_row,
+            column=1,
+            value=clean_cell_value(
+                f"* PERINGATAN: {len(comment_truncations)} post hanya memiliki sebagian komentar terbaca "
+                f"(batas {comments_per_post_limit} komentar per post). Peringkat dihitung dari data yang berhasil dibaca."
+            ),
+        ).font = Font(name="Calibri", italic=True, size=9, color="C65911")
+        note_row += 1
+
+    comment_unknowns = diagnostics.get("comment_unknowns")
+    if isinstance(comment_unknowns, list) and comment_unknowns:
+        ws_summary.cell(
+            row=note_row,
+            column=1,
+            value=clean_cell_value(
+                f"* PERINGATAN: Kelengkapan komentar pada {len(comment_unknowns)} post tidak dapat "
+                "diverifikasi karena total komentar tidak diberikan Instagram."
+            ),
+        ).font = Font(name="Calibri", italic=True, size=9, color="C65911")
+        note_row += 1
+
+    if diagnostics.get("liker_circuit_open"):
+        liker_circuit_reason = str(
+            diagnostics.get("liker_circuit_reason")
+            or "Pemeriksaan liker dihentikan untuk sebagian post demi membatasi request."
+        ).rstrip(". ")
+        ws_summary.cell(
+            row=note_row,
+            column=1,
+            value=clean_cell_value(
+                f"* PERINGATAN: {liker_circuit_reason}; "
+                "status terkait tetap 'Belum dapat diverifikasi'."
+            ),
+        ).font = Font(name="Calibri", italic=True, size=9, color="C65911")
 
     _auto_fit_columns(ws_summary)
 
@@ -257,6 +385,13 @@ def export_to_excel(
         "Username",
         "Teks Komentar",
         "Sudah Like Post?",
+        "Status Pemeriksaan Like",
+        "Sumber Pemeriksaan",
+        "Alasan/Detail",
+        "Liker Terbaca",
+        "Daftar Liker Lengkap?",
+        "Namespace Username Lengkap?",
+        "Namespace User ID Lengkap?",
         "Like Komentar",
         "Tanggal Komentar",
         "Post URL",
@@ -272,12 +407,24 @@ def export_to_excel(
         ws_detail.cell(row=row, column=1, value=clean_cell_value(comment.get("commenter_username", "unknown")))
         ws_detail.cell(row=row, column=2, value=clean_cell_value(comment.get("comment_text", "")))
         ws_detail.cell(row=row, column=3, value=clean_cell_value(comment.get("has_liked_post", "N/A")))
-        ws_detail.cell(row=row, column=4, value=comment.get("comment_likes", 0))
-        ws_detail.cell(row=row, column=5, value=clean_cell_value(format_tanggal_indonesia(comment.get("comment_date", "N/A"))))
-        ws_detail.cell(row=row, column=6, value=clean_cell_value(comment.get("post_url", "")))
-        ws_detail.cell(row=row, column=7, value=comment.get("post_likes", 0))
-        ws_detail.cell(row=row, column=8, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
-        ws_detail.cell(row=row, column=9, value=clean_cell_value(comment.get("post_caption", "")))
+        ws_detail.cell(row=row, column=4, value=_lookup_status_for_excel(comment.get("like_lookup_status")))
+        ws_detail.cell(row=row, column=5, value=clean_cell_value(comment.get("like_lookup_source", "")))
+        ws_detail.cell(row=row, column=6, value=clean_cell_value(comment.get("like_lookup_reason", "")))
+        ws_detail.cell(
+            row=row,
+            column=7,
+            value=_optional_count_for_excel(comment.get("liker_count_observed")),
+        )
+        lookup_complete = comment.get("liker_lookup_complete")
+        ws_detail.cell(row=row, column=8, value=_boolean_for_excel(lookup_complete))
+        ws_detail.cell(row=row, column=9, value=_boolean_for_excel(comment.get("liker_usernames_complete")))
+        ws_detail.cell(row=row, column=10, value=_boolean_for_excel(comment.get("liker_user_ids_complete")))
+        ws_detail.cell(row=row, column=11, value=_optional_count_for_excel(comment.get("comment_likes")))
+        ws_detail.cell(row=row, column=12, value=clean_cell_value(format_tanggal_indonesia(comment.get("comment_date", "N/A"))))
+        ws_detail.cell(row=row, column=13, value=clean_cell_value(comment.get("post_url", "")))
+        ws_detail.cell(row=row, column=14, value=_optional_count_for_excel(comment.get("post_likes")))
+        ws_detail.cell(row=row, column=15, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
+        ws_detail.cell(row=row, column=16, value=clean_cell_value(comment.get("post_caption", "")))
 
         if i % 2 == 1:
             for col in range(1, detail_col_count + 1):
@@ -310,7 +457,7 @@ def export_to_excel(
                 seen_urls.add(p_url)
                 unique_posts.append({
                     "post_url": p_url,
-                    "post_likes": p.get("post_likes", 0),
+                    "post_likes": p.get("post_likes"),
                     "post_date": p.get("post_date", "N/A"),
                     "post_caption": p.get("post_caption", ""),
                 })
@@ -324,18 +471,18 @@ def export_to_excel(
                 seen_urls.add(p_url)
                 unique_posts.append({
                     "post_url": p_url,
-                    "post_likes": c.get("post_likes", 0),
+                    "post_likes": c.get("post_likes"),
                     "post_date": c.get("post_date", "N/A"),
                     "post_caption": c.get("post_caption", ""),
                 })
 
-    unique_posts.sort(key=lambda x: x.get("post_likes", 0), reverse=True)
+    unique_posts.sort(key=lambda x: _count_sort_value(x.get("post_likes")), reverse=True)
 
     for i, p in enumerate(unique_posts, 1):
         row = i + 1
         ws_posts.cell(row=row, column=1, value=i)
         ws_posts.cell(row=row, column=2, value=clean_cell_value(p.get("post_url", "")))
-        ws_posts.cell(row=row, column=3, value=p.get("post_likes", 0))
+        ws_posts.cell(row=row, column=3, value=_optional_count_for_excel(p.get("post_likes")))
         ws_posts.cell(row=row, column=4, value=clean_cell_value(format_tanggal_indonesia(p.get("post_date", "N/A"))))
         ws_posts.cell(row=row, column=5, value=clean_cell_value(p.get("post_caption", "")))
 
@@ -378,13 +525,13 @@ def export_links_to_excel(
     ws.title = "Daftar Link Postingan"
 
     # Info header
-    ws.merge_cells("A1:E1")
+    ws.merge_cells("A1:F1")
     title_cell = ws["A1"]
     title_cell.value = clean_cell_value(f"Daftar Link Postingan ({platform}) — @{target_username}")
     title_cell.font = Font(name="Calibri", bold=True, size=14, color="1F4E79")
     title_cell.alignment = Alignment(horizontal="center")
 
-    ws.merge_cells("A2:E2")
+    ws.merge_cells("A2:F2")
     ws["A2"].value = clean_cell_value(f"Periode: {start_date} s/d {end_date} • Total: {len(posts)} Postingan")
     ws["A2"].font = Font(name="Calibri", size=11, italic=True)
     ws["A2"].alignment = Alignment(horizontal="center")
@@ -406,7 +553,7 @@ def export_links_to_excel(
         ws.cell(row=row, column=2, value=clean_cell_value(p.get("post_url", "")))
         ws.cell(row=row, column=3, value=clean_cell_value(format_tanggal_indonesia(p.get("post_date", "N/A"))))
         ws.cell(row=row, column=4, value=clean_cell_value(p.get("post_type", "Video").upper()))
-        ws.cell(row=row, column=5, value=p.get("post_likes", 0))
+        ws.cell(row=row, column=5, value=_optional_count_for_excel(p.get("post_likes")))
         ws.cell(row=row, column=6, value=clean_cell_value(p.get("post_caption", "")))
 
         if i % 2 == 0:

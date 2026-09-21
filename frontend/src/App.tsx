@@ -6,6 +6,7 @@ import type {
   AnalysisResultPayload,
   WebSocketMessage,
   LogEntry,
+  LikeVerificationStatus,
 } from './types';
 
 const isServedDirectlyByFastAPI = typeof window !== 'undefined' && window.location.port === '8008';
@@ -28,6 +29,94 @@ const safeJson = async (res: Response): Promise<Record<string, any>> => {
   } catch {
     return {};
   }
+};
+
+const normalizeInstagramUsername = (value: string): string => value.trim().replace(/^@+/, '');
+
+const formatNullableCount = (value: number | null | undefined): string =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? value.toLocaleString()
+    : 'Tidak tersedia';
+
+const formatPossiblyIncompleteCount = (
+  value: number | null | undefined,
+  unknownCount: number | undefined,
+): string => {
+  const formatted = formatNullableCount(value);
+  return typeof value === 'number' && Number.isFinite(value) && (unknownCount ?? 0) > 0
+    ? `≥${formatted}`
+    : formatted;
+};
+
+const getCommentLikesPresentation = (commenter: TopCommenter) => {
+  const value = commenter.total_comment_likes;
+  const knownCount = commenter.comment_likes_known_count ?? 0;
+  const unknownCount = commenter.comment_likes_unknown_count ?? 0;
+
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return {
+      label: 'Tidak tersedia',
+      incomplete: true,
+      title: unknownCount > 0
+        ? `Like komentar tidak tersedia untuk ${unknownCount} komentar.`
+        : 'Data like komentar tidak tersedia.',
+    };
+  }
+
+  const incomplete = commenter.comment_likes_complete === false || unknownCount > 0;
+  if (incomplete) {
+    return {
+      label: `≥${value.toLocaleString()}`,
+      incomplete: true,
+      title: `${value.toLocaleString()} like berasal dari ${knownCount} komentar yang datanya tersedia; ${unknownCount} komentar belum tersedia.`,
+    };
+  }
+
+  return {
+    label: value.toLocaleString(),
+    incomplete: false,
+    title: `${value.toLocaleString()} like komentar`,
+  };
+};
+
+const getLikeStatusPresentation = (status?: LikeVerificationStatus | null) => {
+  const rawStatus = typeof status === 'string' ? status.trim() : '';
+
+  if (rawStatus === 'Ya' || rawStatus.startsWith('Ya (')) {
+    return {
+      label: rawStatus,
+      title: rawStatus,
+      background: 'rgba(16, 185, 129, 0.15)',
+      color: 'var(--accent-green)',
+    };
+  }
+
+  if (rawStatus === 'Tidak') {
+    return {
+      label: 'Tidak',
+      title: 'Tidak',
+      background: 'rgba(239, 68, 68, 0.15)',
+      color: 'var(--accent-red)',
+    };
+  }
+
+  if (rawStatus === 'N/A') {
+    return {
+      label: 'N/A',
+      title: 'Tidak berlaku untuk sumber data ini',
+      background: 'rgba(255,255,255,0.05)',
+      color: 'var(--text-muted)',
+    };
+  }
+
+  return {
+    label: 'Belum dapat diverifikasi',
+    title: rawStatus && rawStatus !== 'Belum dapat diverifikasi'
+      ? `Status sumber: ${rawStatus}`
+      : 'Instagram belum menyediakan data yang cukup untuk memverifikasi status ini',
+    background: 'rgba(245, 158, 11, 0.15)',
+    color: '#f59e0b',
+  };
 };
 
 export default function App(): React.JSX.Element {
@@ -127,12 +216,15 @@ export default function App(): React.JSX.Element {
 
   // Cek apakah akun instagram memiliki sesi tersimpan
   useEffect(() => {
-    if (!igUser || platform !== 'instagram') {
+    if (platform !== 'instagram') {
       setHasSavedSession(false);
       return;
     }
-    const clean = igUser.replace('@', '').trim();
-    if (!clean) return;
+    const clean = normalizeInstagramUsername(igUser);
+    if (!clean) {
+      setHasSavedSession(false);
+      return;
+    }
     const timer = setTimeout(async () => {
       try {
         const res = await fetch(`${API_BASE}/api/instagram/session-status?username=${encodeURIComponent(clean)}`);
@@ -148,7 +240,7 @@ export default function App(): React.JSX.Element {
   }, [igUser, platform]);
 
   const handleClearSession = async () => {
-    const clean = igUser.replace('@', '').trim();
+    const clean = normalizeInstagramUsername(igUser);
     if (!clean) return;
     try {
       await fetch(`${API_BASE}/api/instagram/clear-session`, {
@@ -329,9 +421,18 @@ export default function App(): React.JSX.Element {
       alert('Target akun tidak boleh kosong!');
       return;
     }
-    if (platform === 'instagram' && (!igUser || !igPass)) {
-      alert('Instagram mewajibkan username dan password login!');
-      return;
+    if (platform === 'instagram') {
+      const cleanIgUsername = normalizeInstagramUsername(igUser);
+
+      if (igLoginMode === 'credentials' && (!cleanIgUsername || !igPass)) {
+        alert('Mode Password mewajibkan username dan password Instagram!');
+        return;
+      }
+
+      if (igLoginMode === 'sessionid' && !igSessionId.trim()) {
+        alert('Mode Session ID mewajibkan cookie sessionid Instagram!');
+        return;
+      }
     }
 
     setIsLoading(true);
@@ -369,7 +470,7 @@ export default function App(): React.JSX.Element {
           start_date: startDate,
           end_date: endDate,
           top_n: Number(topN) || 10,
-          ig_username: igUser ? igUser.replace('@', '').trim() : null,
+          ig_username: normalizeInstagramUsername(igUser) || null,
           ig_password: igLoginMode === 'credentials' ? (igPass || null) : null,
           ig_session_id: igLoginMode === 'sessionid' ? (igSessionId.trim() || null) : null,
         }),
@@ -413,6 +514,7 @@ export default function App(): React.JSX.Element {
           all_comments: analysisResult.all_comments || [],
           scraped_posts: analysisResult.scraped_posts || [],
           summary_stats: analysisResult.summary || {},
+          analysis_diagnostics: analysisResult.diagnostics || {},
           target_username: target.replace('@', '').trim(),
           start_date: startDate,
           end_date: endDate,
@@ -681,7 +783,7 @@ export default function App(): React.JSX.Element {
                   <input
                     type="text"
                     className="custom-input"
-                    placeholder="Username Instagram Anda (misal: zenfdn)"
+                    placeholder="Username Instagram Anda (wajib)"
                     value={igUser}
                     onChange={(e) => setIgUser(e.target.value)}
                   />
@@ -694,7 +796,7 @@ export default function App(): React.JSX.Element {
                   />
                   {hasSavedSession && (
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '2px' }}>
-                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Identitas perangkat Anda telah disimpan.</span>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Sesi lokal tersedia untuk akun ini.</span>
                       <button
                         type="button"
                         onClick={handleClearSession}
@@ -713,21 +815,22 @@ export default function App(): React.JSX.Element {
                   <input
                     type="text"
                     className="custom-input"
-                    placeholder="Username Akun Anda (opsional)"
+                    placeholder="Username Instagram Anda (opsional)"
                     value={igUser}
                     onChange={(e) => setIgUser(e.target.value)}
                   />
                   <input
-                    type="text"
+                    type="password"
                     className="custom-input"
                     placeholder="Paste cookie sessionid di sini"
                     value={igSessionId}
                     onChange={(e) => setIgSessionId(e.target.value)}
+                    autoComplete="off"
                     style={{ fontFamily: 'monospace', fontSize: '12px' }}
                   />
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '11px', color: 'var(--accent-cyan)', fontWeight: '600' }}>
-                      ⭐ Bebas Challenge / 2FA 100%
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: '600', lineHeight: '1.4' }}>
+                      🔐 Rahasiakan Session ID; sesi dapat kedaluwarsa atau dicabut.
                     </span>
                     <button
                       type="button"
@@ -878,9 +981,9 @@ export default function App(): React.JSX.Element {
                   </b>
                   1. Buka aplikasi Instagram di ponsel Anda.<br />
                   2. Ketuk notifikasi atau banner keamanan, lalu pilih <b>'Ini Saya'</b> (This Was Me).<br />
-                  3. Klik tombol <b>'Mulai Scraping &amp; Analisis'</b> kembali di aplikasi ini (identitas perangkat Anda telah disimpan).<br />
+                  3. Setelah konfirmasi selesai, klik tombol <b>'Mulai Scraping &amp; Analisis'</b> kembali di aplikasi ini.<br />
                   <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
-                    💡 Tips: Anda juga dapat beralih ke tab <b>'Cookie Session ID'</b> untuk login tanpa challenge.
+                    💡 Session ID bukan cara melewati pemeriksaan keamanan; Instagram tetap dapat meminta verifikasi.
                   </span>
                 </div>
               </div>
@@ -927,18 +1030,109 @@ export default function App(): React.JSX.Element {
                   <p style={{ fontSize: '24px', fontWeight: '800', marginTop: '4px' }}>{analysisResult.total_posts}</p>
                 </div>
                 <div className="glass-panel" style={{ padding: '14px 18px', background: 'rgba(59, 130, 246, 0.08)', border: '1px solid rgba(59, 130, 246, 0.2)' }}>
-                  <span style={{ fontSize: '11px', color: 'var(--accent-blue)', fontWeight: '600' }}>TOTAL KOMENTAR</span>
+                  <span style={{ fontSize: '11px', color: 'var(--accent-blue)', fontWeight: '600' }}>KOMENTAR TERBACA</span>
                   <p style={{ fontSize: '24px', fontWeight: '800', marginTop: '4px' }}>{analysisResult.total_comments}</p>
                 </div>
-                <div className="glass-panel" style={{ padding: '14px 18px', background: 'rgba(139, 92, 246, 0.08)', border: '1px solid rgba(139, 92, 246, 0.2)' }}>
+                <div
+                  className="glass-panel"
+                  title={typeof analysisResult.summary.total_post_likes !== 'number'
+                    ? 'Jumlah like post tidak tersedia.'
+                    : (analysisResult.summary.post_likes_unknown_count ?? 0) > 0
+                      ? `${analysisResult.summary.post_likes_unknown_count} post tidak menyediakan jumlah like; angka yang tampil adalah batas minimum.`
+                      : 'Jumlah like dari seluruh post.'}
+                  style={{ padding: '14px 18px', background: 'rgba(139, 92, 246, 0.08)', border: '1px solid rgba(139, 92, 246, 0.2)' }}
+                >
                   <span style={{ fontSize: '11px', color: 'var(--accent-purple)', fontWeight: '600' }}>TOTAL LIKES POST</span>
-                  <p style={{ fontSize: '24px', fontWeight: '800', marginTop: '4px' }}>{(analysisResult.summary.total_post_likes || 0).toLocaleString()}</p>
+                  <p style={{ fontSize: '24px', fontWeight: '800', marginTop: '4px' }}>
+                    {formatPossiblyIncompleteCount(
+                      analysisResult.summary.total_post_likes,
+                      analysisResult.summary.post_likes_unknown_count,
+                    )}
+                  </p>
                 </div>
                 <div className="glass-panel" style={{ padding: '14px 18px', background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.2)' }}>
                   <span style={{ fontSize: '11px', color: 'var(--accent-green)', fontWeight: '600' }}>UNIQUE COMMENTERS</span>
                   <p style={{ fontSize: '24px', fontWeight: '800', marginTop: '4px' }}>{analysisResult.summary.unique_commenters}</p>
                 </div>
               </div>
+
+              {platform === 'instagram' && (
+                <div style={{
+                  marginBottom: '16px',
+                  padding: '9px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(245, 158, 11, 0.3)',
+                  background: 'rgba(245, 158, 11, 0.08)',
+                  color: '#fbbf24',
+                  fontSize: '11px',
+                  lineHeight: '1.45',
+                }}>
+                  “Belum dapat diverifikasi” bukan berarti “Tidak”. Status “Tidak” hanya ditampilkan jika daftar liker terbukti lengkap.
+                </div>
+              )}
+
+              {Array.isArray(analysisResult.diagnostics?.comment_errors)
+                && analysisResult.diagnostics.comment_errors.length > 0 && (
+                <div style={{
+                  marginBottom: '16px',
+                  padding: '9px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                  background: 'rgba(239, 68, 68, 0.08)',
+                  color: '#fca5a5',
+                  fontSize: '11px',
+                  lineHeight: '1.45',
+                }}>
+                  Hasil komentar parsial: {analysisResult.diagnostics.comment_errors.length} post tidak dapat diambil. Periksa log sebelum memakai peringkat sebagai hasil final.
+                </div>
+              )}
+
+              {Array.isArray(analysisResult.diagnostics?.comment_truncations)
+                && analysisResult.diagnostics.comment_truncations.length > 0 && (
+                <div style={{
+                  marginBottom: '16px',
+                  padding: '9px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(245, 158, 11, 0.3)',
+                  background: 'rgba(245, 158, 11, 0.08)',
+                  color: '#fbbf24',
+                  fontSize: '11px',
+                  lineHeight: '1.45',
+                }}>
+                  {analysisResult.diagnostics.comment_truncations.length} post hanya memiliki sebagian komentar terbaca (maksimal {analysisResult.diagnostics.comments_per_post_limit || 100} per post). Peringkat dihitung dari data yang berhasil dibaca.
+                </div>
+              )}
+
+              {Array.isArray(analysisResult.diagnostics?.comment_unknowns)
+                && analysisResult.diagnostics.comment_unknowns.length > 0 && (
+                <div style={{
+                  marginBottom: '16px',
+                  padding: '9px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(245, 158, 11, 0.3)',
+                  background: 'rgba(245, 158, 11, 0.08)',
+                  color: '#fbbf24',
+                  fontSize: '11px',
+                  lineHeight: '1.45',
+                }}>
+                  Kelengkapan komentar tidak dapat diverifikasi pada {analysisResult.diagnostics.comment_unknowns.length} post karena total komentar tidak diberikan Instagram.
+                </div>
+              )}
+
+              {analysisResult.diagnostics?.liker_circuit_open && (
+                <div style={{
+                  marginBottom: '16px',
+                  padding: '9px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(245, 158, 11, 0.3)',
+                  background: 'rgba(245, 158, 11, 0.08)',
+                  color: '#fbbf24',
+                  fontSize: '11px',
+                  lineHeight: '1.45',
+                }}>
+                  {analysisResult.diagnostics.liker_circuit_reason || 'Pemeriksaan liker dihentikan untuk sebagian post demi membatasi request.'} Status terkait tetap “Belum dapat diverifikasi”.
+                </div>
+              )}
 
               {/* Table Action Bar */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '18px' }}>
@@ -984,13 +1178,17 @@ export default function App(): React.JSX.Element {
                       <th style={{ padding: '12px 16px' }}>Username</th>
                       <th style={{ padding: '12px 16px', textAlign: 'center' }}>Jumlah Komen</th>
                       <th style={{ padding: '12px 16px' }}>Komentar Pertama</th>
-                      <th style={{ padding: '12px 16px', textAlign: 'center' }}>Sudah Like?</th>
-                      <th style={{ padding: '12px 16px', textAlign: 'center' }}>Like Komen</th>
+                      <th style={{ padding: '12px 16px', textAlign: 'center' }}>Sudah Like Post?</th>
+                      <th style={{ padding: '12px 16px', textAlign: 'center' }}>Like Komentar</th>
                       <th style={{ padding: '12px 16px', textAlign: 'center' }}>Aksi</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredCommenters.map((c, index) => (
+                    {filteredCommenters.map((c, index) => {
+                      const likeStatus = getLikeStatusPresentation(c.has_liked_post);
+                      const commentLikes = getCommentLikesPresentation(c);
+
+                      return (
                       <tr key={index} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)', transition: 'background 0.2s' }} className="glass-panel-hover">
                         <td style={{ padding: '12px 16px', textAlign: 'center', fontWeight: '800' }}>
                           {c.rank === 1 ? '🥇 #1' : c.rank === 2 ? '🥈 #2' : c.rank === 3 ? '🥉 #3' : `#${c.rank}`}
@@ -1012,14 +1210,20 @@ export default function App(): React.JSX.Element {
                             borderRadius: '6px',
                             fontSize: '11px',
                             fontWeight: '600',
-                            background: c.has_liked_post === 'Ya' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(255,255,255,0.05)',
-                            color: c.has_liked_post === 'Ya' ? 'var(--accent-green)' : 'var(--text-muted)'
-                          }}>
-                            {c.has_liked_post || 'N/A'}
+                            background: likeStatus.background,
+                            color: likeStatus.color,
+                          }} title={likeStatus.title}>
+                            {likeStatus.label}
                           </span>
                         </td>
-                        <td style={{ padding: '12px 16px', textAlign: 'center', color: 'var(--accent-blue)', fontWeight: '600' }}>
-                          {(c.total_comment_likes || 0).toLocaleString()}
+                        <td
+                          title={commentLikes.title}
+                          style={{ padding: '12px 16px', textAlign: 'center', color: commentLikes.incomplete ? '#f59e0b' : 'var(--accent-blue)', fontWeight: '600' }}
+                        >
+                          <div>{commentLikes.label}</div>
+                          {commentLikes.incomplete && c.total_comment_likes !== null && c.total_comment_likes !== undefined && (
+                            <div style={{ marginTop: '2px', fontSize: '9px', fontWeight: '500' }}>belum lengkap</div>
+                          )}
                         </td>
                         <td style={{ padding: '12px 16px', textAlign: 'center' }}>
                           <button
@@ -1031,7 +1235,8 @@ export default function App(): React.JSX.Element {
                           </button>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1091,7 +1296,10 @@ export default function App(): React.JSX.Element {
                   );
                 }
 
-                return userComments.map((comm: any, idx: number) => (
+                return userComments.map((comm: any, idx: number) => {
+                  const likeStatus = getLikeStatusPresentation(comm.has_liked_post);
+
+                  return (
                   <div
                     key={idx}
                     style={{
@@ -1103,12 +1311,12 @@ export default function App(): React.JSX.Element {
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px', fontSize: '11px', color: 'var(--text-muted)' }}>
                       <span>Tanggal: {formatIndoDateTime(comm.comment_date)}</span>
-                      <span>👍 {comm.comment_likes || 0} Like Komentar</span>
+                      <span>👍 Like Komentar: {formatNullableCount(comm.comment_likes)}</span>
                     </div>
                     <p style={{ fontSize: '13px', color: 'var(--text-primary)', marginBottom: '8px', lineHeight: '1.4' }}>
                       "{comm.comment_text || ''}"
                     </p>
-                    <div style={{ fontSize: '11px', color: 'var(--accent-blue)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontSize: '11px', color: 'var(--accent-blue)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
                       {comm.post_url ? (
                         <button
                           type="button"
@@ -1132,10 +1340,32 @@ export default function App(): React.JSX.Element {
                       ) : (
                         <span style={{ color: 'var(--text-muted)' }}>-</span>
                       )}
-                      <span style={{ color: 'var(--text-muted)' }}>Likes Post: {comm.post_likes || 0}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        <span style={{ color: 'var(--text-muted)' }}>Likes Post: {formatNullableCount(comm.post_likes)}</span>
+                        <span
+                          title={[
+                            likeStatus.title,
+                            comm.like_lookup_source ? `Sumber: ${comm.like_lookup_source}` : '',
+                            comm.like_lookup_reason,
+                          ]
+                            .filter((value) => typeof value === 'string' && value.trim())
+                            .join(' — ')}
+                          style={{
+                            padding: '2px 6px',
+                            borderRadius: '5px',
+                            fontSize: '10px',
+                            fontWeight: '600',
+                            background: likeStatus.background,
+                            color: likeStatus.color,
+                          }}
+                        >
+                          Sudah Like Post? {likeStatus.label}
+                        </span>
+                      </div>
                     </div>
                   </div>
-                ));
+                  );
+                });
               })()}
             </div>
           </div>
