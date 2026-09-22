@@ -28,15 +28,15 @@ SESSION_DIR = Path.home() / ".instagram_sessions"
 # dapat memakai cookie sessionid browser tanpa autentikasi endpoint mobile.
 PROFILE_WEB_DOC_ID = "34579740524958711"
 REELS_WEB_DOC_ID = "27234427476213202"
-MEDIA_LIKERS_WEB_DOC_ID = "27928626103504365"
 INSTAGRAM_SNOWFLAKE_EPOCH_MS = 1_314_220_021_721
-LIKER_LOOKUP_FAILURE_LIMIT = 3
+LIKER_LOOKUP_FAILURE_LIMIT = 5
+LIKER_CIRCUIT_COOLDOWN_POSTS = 5
 COMMENT_FETCH_FAILURE_LIMIT = 3
 LIKER_LOOKUP_JOB_LIMIT = 20
 COMMENTS_PER_POST_LIMIT = 100
 OEMBED_CAPTION_ENRICH_LIMIT = 10
 OEMBED_REQUEST_INTERVAL_SECONDS = 0.5
-LIKER_BROWSER_MAX_SCROLLS = 6
+LIKER_BROWSER_MAX_SCROLLS = 14
 LIKER_BROWSER_MIN_INTERVAL_SECONDS = 1.25
 COMMENT_BROWSER_MAX_LOADS = 8
 COMMENT_SOURCE_FAILURE_LIMIT = 3
@@ -1736,6 +1736,29 @@ class _InstagramLikerBrowser:
         return usernames
 
     @staticmethod
+    def _pick_interactive_link(locator):
+        """Pilih anchor yang benar-benar dapat membuka dialog.
+
+        Instagram kadang merender anchor duplikat dengan href identik: satu
+        dekoratif tanpa teks yang tidak memicu apa pun saat diklik, satu lagi
+        berisi teks (mis. "31 lainnya") yang benar-benar membuka dialog.
+        ``.first`` tanpa filter bisa mengenai elemen dekoratif sehingga dialog
+        tidak pernah terbuka dan berujung timeout.
+        """
+        try:
+            count = locator.count()
+        except Exception:
+            return locator.first
+        for i in range(count):
+            candidate = locator.nth(i)
+            try:
+                if candidate.is_visible() and (candidate.text_content() or "").strip():
+                    return candidate
+            except Exception:
+                continue
+        return locator.first
+
+    @staticmethod
     def _security_redirect_reason(page_url: Any) -> str:
         """Kenali halaman login/challenge sebelum melakukan request tambahan."""
         normalized = str(page_url or "").lower()
@@ -1944,20 +1967,38 @@ class _InstagramLikerBrowser:
                     fallback_liked_by_link.first.wait_for(state="attached", timeout=2_500)
                     liked_by_link = fallback_liked_by_link
                 except Exception:
-                    redirect_reason = self._security_redirect_reason(self.page.url)
-                    if redirect_reason:
+                    # Post carousel/album tidak selalu merender anchor apa pun
+                    # untuk like count -- hanya teks angka biasa (mis. span
+                    # berisi "12") yang tetap memicu dialog yang sama saat
+                    # diklik. Coba elemen ini sebelum menyerah.
+                    count_liked_by_link = None
+                    if isinstance(expected_count, int) and expected_count > 0:
+                        count_candidate = self.page.locator("span, div, button").filter(
+                            has_text=re.compile(rf"^\s*{expected_count}\s*$")
+                        )
+                        try:
+                            count_candidate.first.wait_for(state="attached", timeout=2_500)
+                            count_liked_by_link = count_candidate
+                        except Exception:
+                            count_liked_by_link = None
+
+                    if count_liked_by_link is not None:
+                        liked_by_link = count_liked_by_link
+                    else:
+                        redirect_reason = self._security_redirect_reason(self.page.url)
+                        if redirect_reason:
+                            return LikerLookupResult(
+                                status="unauthenticated",
+                                source="browser_web",
+                                reason=redirect_reason,
+                                expected_count=expected_count,
+                            )
                         return LikerLookupResult(
-                            status="unauthenticated",
+                            status="unavailable",
                             source="browser_web",
-                            reason=redirect_reason,
+                            reason="Kontrol daftar liker tidak tersedia pada tampilan post ini.",
                             expected_count=expected_count,
                         )
-                    return LikerLookupResult(
-                        status="unavailable",
-                        source="browser_web",
-                        reason="Kontrol daftar liker tidak tersedia pada tampilan post ini.",
-                        expected_count=expected_count,
-                    )
 
             def is_liker_response(response) -> bool:
                 try:
@@ -1978,11 +2019,17 @@ class _InstagramLikerBrowser:
             dom_usernames: set[str] = set()
             self.page.on("response", capture_response)
             try:
-                liked_by_link.first.click()
+                self._pick_interactive_link(liked_by_link).click()
                 dialog = self.page.locator('[role="dialog"]')
                 dialog.wait_for(state="visible", timeout=10_000)
                 self.page.wait_for_timeout(900)
 
+                # Daftar liker dirender virtualized: entri lama bisa ter-unmount
+                # saat scroll melompat langsung ke scrollHeight, sehingga
+                # sejumlah username tidak pernah terbaca. Scroll bertahap kecil
+                # (bukan lompat ke akhir) memberi waktu React merender baris
+                # baru tanpa kehilangan yang sudah terbaca.
+                dialog_box = dialog.bounding_box()
                 stable_rounds = 0
                 previous_observed = -1
                 for _ in range(LIKER_BROWSER_MAX_SCROLLS):
@@ -2001,10 +2048,20 @@ class _InstagramLikerBrowser:
                             const el = candidates.reduce((a, b) =>
                                 a.scrollHeight >= b.scrollHeight ? a : b);
                             const before = el.scrollTop;
-                            el.scrollTop = el.scrollHeight;
+                            const step = Math.max(el.clientHeight * 0.8, 200);
+                            el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight);
                             return { moved: el.scrollTop > before };
                         }"""
                     )
+                    if dialog_box:
+                        try:
+                            self.page.mouse.move(
+                                dialog_box["x"] + dialog_box["width"] / 2,
+                                dialog_box["y"] + dialog_box["height"] / 2,
+                            )
+                            self.page.mouse.wheel(0, 600)
+                        except Exception:
+                            pass
                     if not (scroll_state or {}).get("moved") and stable_rounds:
                         break
                     # Pagination sengaja diberi jeda dan dibatasi agar tidak
@@ -2190,74 +2247,13 @@ def _get_media_liker_identities(
 
     attempts: list[LikerLookupResult] = []
 
-    # Query lama instagrapi (doc_id 24452425501069647) sudah ditolak Instagram.
-    # PolarisPostLikedByListDialogQuery adalah query yang dipakai web Instagram
-    # saat ini dan berjalan melalui endpoint /graphql/query yang sama dengan
-    # pengambilan feed/Reels.
+    # PolarisPostLikedByListDialogQuery lewat panggilan HTTP langsung
+    # (tanpa fb_dtsg/lsd/parameter Comet lain yang hanya tersedia dari
+    # halaman yang benar-benar di-hydrate browser) terverifikasi selalu
+    # mengembalikan likers_connection=null, bukan error. Jalur ini tidak
+    # pernah bisa berhasil sehingga dilewati; ambil langsung dari dialog
+    # liked_by browser yang membawa sesi hasil hydration sungguhan.
     if getattr(cl, "_instagram_web_session", False):
-        web_graphql_disabled = bool(
-            getattr(cl, "_instagram_liker_web_graphql_disabled", False)
-        )
-        if web_graphql_disabled:
-            attempts.append(
-                LikerLookupResult(
-                    status="unavailable",
-                    source="web_graphql",
-                    reason="GraphQL Web liker dinonaktifkan untuk job ini setelah connection tidak tersedia.",
-                    expected_count=post_likes,
-                )
-            )
-        else:
-            try:
-                _sync_web_cookies(cl)
-                data = cl.public_doc_id_graphql_request(
-                    MEDIA_LIKERS_WEB_DOC_ID,
-                    {"media_id": media_pk},
-                    referer=get_instagram_media_url(media),
-                    headers={"X-FB-Friendly-Name": "PolarisPostLikedByListDialogQuery"},
-                )
-                media_node = (data or {}).get("fetch__XDTMediaDict") or {}
-                connection = media_node.get("likers_connection")
-                if connection is not None:
-                    web_likers = _liker_connection_nodes(connection)
-                    usernames, user_ids = _liker_identity_sets(web_likers)
-                    page_info = connection.get("page_info") or {}
-                    attempts.append(
-                        _liker_result_from_identities(
-                            usernames,
-                            user_ids,
-                            source="web_graphql",
-                            expected_count=post_likes,
-                            reached_end=page_info.get("has_next_page") is False,
-                            connection_total=_liker_connection_total(connection),
-                        )
-                    )
-                else:
-                    setattr(cl, "_instagram_liker_web_graphql_disabled", True)
-                    attempts.append(
-                        LikerLookupResult(
-                            status="unavailable",
-                            source="web_graphql",
-                            reason="GraphQL Web tidak menyediakan likers_connection.",
-                            expected_count=post_likes,
-                        )
-                    )
-            except Exception as exc:
-                _raise_if_terminal_instagram_error(exc, "mengambil daftar liker melalui GraphQL Web")
-                attempts.append(
-                    LikerLookupResult(
-                        status="error",
-                        source="web_graphql",
-                        reason="GraphQL Web gagal mengambil daftar liker.",
-                        errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
-                        expected_count=post_likes,
-                    )
-                )
-
-        if attempts and attempts[-1].complete:
-            cache[cache_key] = attempts[-1]
-            return attempts[-1]
-
         # Endpoint /api/graphql yang dipakai UI memerlukan token Comet dinamis.
         # Browser dibuka sekali dan digunakan ulang untuk semua post dalam job.
         if liker_browser is not None:
@@ -2665,6 +2661,8 @@ def get_all_comments(
     consecutive_comment_failures = 0
     liker_lookup_attempts = 0
     liker_circuit_reason = ""
+    liker_circuit_permanent = False
+    liker_circuit_reopen_at: Optional[int] = None
     job_diagnostics = {
         "comment_errors": [],
         "comment_truncations": [],
@@ -2694,11 +2692,29 @@ def get_all_comments(
                     f"Mengambil komentar post {i+1}/{total} (ID: {post_code}, {post_date})..."
                 )
 
+            # Circuit breaker karena kegagalan beruntun bersifat sementara:
+            # setelah cooldown, browser dibuka lagi dan pemeriksaan dicoba
+            # ulang alih-alih mematikan sisa job secara permanen.
+            if (
+                liker_circuit_reason
+                and not liker_circuit_permanent
+                and liker_circuit_reopen_at is not None
+                and i >= liker_circuit_reopen_at
+            ):
+                liker_circuit_reason = ""
+                liker_circuit_reopen_at = None
+                consecutive_liker_failures = 0
+                job_diagnostics["liker_circuit_open"] = False
+                job_diagnostics["liker_circuit_reason"] = ""
+                if liker_browser is None and getattr(cl, "_instagram_web_session", False):
+                    liker_browser = _InstagramLikerBrowser(cl)
+
             if not liker_circuit_reason and liker_lookup_attempts >= LIKER_LOOKUP_JOB_LIMIT:
                 liker_circuit_reason = (
                     f"Pemeriksaan liker dibatasi maksimal {LIKER_LOOKUP_JOB_LIMIT} post per pekerjaan "
                     "untuk mengurangi request berulang ke Instagram."
                 )
+                liker_circuit_permanent = True
                 job_diagnostics["liker_circuit_open"] = True
                 job_diagnostics["liker_circuit_reason"] = liker_circuit_reason
                 if liker_browser is not None:
@@ -2822,9 +2838,10 @@ def get_all_comments(
 
                 if consecutive_liker_failures >= LIKER_LOOKUP_FAILURE_LIMIT and not liker_circuit_reason:
                     liker_circuit_reason = (
-                        f"Pemeriksaan liker dihentikan setelah {consecutive_liker_failures} kegagalan beruntun "
-                        "untuk mencegah request berulang."
+                        f"Pemeriksaan liker dijeda sementara setelah {consecutive_liker_failures} kegagalan "
+                        f"beruntun; dicoba lagi setelah {LIKER_CIRCUIT_COOLDOWN_POSTS} post."
                     )
+                    liker_circuit_reopen_at = i + 1 + LIKER_CIRCUIT_COOLDOWN_POSTS
                     job_diagnostics["liker_circuit_open"] = True
                     job_diagnostics["liker_circuit_reason"] = liker_circuit_reason
                     liker_message += f"; {liker_circuit_reason}"
