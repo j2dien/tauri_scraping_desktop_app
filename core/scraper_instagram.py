@@ -38,6 +38,9 @@ OEMBED_CAPTION_ENRICH_LIMIT = 10
 OEMBED_REQUEST_INTERVAL_SECONDS = 0.5
 LIKER_BROWSER_MAX_SCROLLS = 6
 LIKER_BROWSER_MIN_INTERVAL_SECONDS = 1.25
+COMMENT_BROWSER_MAX_LOADS = 8
+COMMENT_SOURCE_FAILURE_LIMIT = 3
+INSTAGRAPI_REQUEST_DELAY_SECONDS = 1
 
 
 class LoginRequiredError(Exception):
@@ -98,6 +101,23 @@ class LikerLookupResult:
             "usernames_complete": self.usernames_complete,
             "user_ids_complete": self.user_ids_complete,
         }
+
+
+@dataclass
+class CommentLookupResult:
+    """Hasil pengambilan komentar dari satu sumber beserta bukti kelengkapannya."""
+
+    comments: list[Any] = field(default_factory=list)
+    status: str = "unavailable"
+    source: str = "none"
+    reason: str = ""
+    errors: list[str] = field(default_factory=list)
+    expected_count: Optional[int] = None
+    reached_end: bool = False
+
+    @property
+    def observed_count(self) -> int:
+        return len(self.comments)
 
 
 def _exception_http_status(exc: BaseException) -> Optional[int]:
@@ -898,7 +918,9 @@ def create_client() -> Client:
     """Buat instance Client instagrapi dengan konfigurasi aman & non-blocking."""
     cl = Client()
     cl.delay_range = [1, 2]
-    cl.request_timeout = 20
+    # Pada instagrapi nilai ini juga dipakai sebagai sleep sebelum request.
+    # Timeout jaringan untuk request buatan aplikasi tetap diberikan eksplisit.
+    cl.request_timeout = INSTAGRAPI_REQUEST_DELAY_SECONDS
     cl.challenge_code_handler = _no_interactive_challenge
     cl.change_password_handler = _no_interactive_password
     return cl
@@ -1005,7 +1027,7 @@ def login_instagram(
 
     cl.challenge_code_handler = _no_interactive_challenge
     cl.change_password_handler = _no_interactive_password
-    cl.request_timeout = 20
+    cl.request_timeout = INSTAGRAPI_REQUEST_DELAY_SECONDS
 
     # 1. Coba gunakan sesi tersimpan terlebih dahulu jika ada
     if session_file.exists():
@@ -1565,6 +1587,72 @@ def _merge_liker_results(
     )
 
 
+def _comment_nodes_from_payload(payload: Any) -> tuple[list[dict], bool]:
+    """Temukan node komentar pada berbagai envelope GraphQL Instagram Web.
+
+    Nama connection dan friendly-name berubah cukup sering. Ekstraksi berbasis
+    bentuk data membuat fallback browser tidak bergantung pada satu doc_id.
+    """
+    comments: list[dict] = []
+    reached_end = False
+    stack = [(payload, "")]
+    seen_objects: set[int] = set()
+
+    while stack:
+        current, path_hint = stack.pop()
+        if isinstance(current, dict):
+            object_id = id(current)
+            if object_id in seen_objects:
+                continue
+            seen_objects.add(object_id)
+
+            page_info = current.get("page_info")
+            if (
+                "comment" in path_hint
+                and isinstance(page_info, dict)
+                and page_info.get("has_next_page") is False
+            ):
+                reached_end = True
+
+            text_value = current.get("text")
+            user_value = current.get("user") or current.get("owner")
+            has_comment_identity = any(
+                key in current
+                for key in (
+                    "id",
+                    "pk",
+                    "created_at",
+                    "created_at_utc",
+                    "comment_like_count",
+                    "like_count",
+                )
+            )
+            if isinstance(text_value, str) and isinstance(user_value, dict) and has_comment_identity:
+                comments.append(current)
+
+            stack.extend(
+                (value, f"{path_hint}.{str(key).lower()}")
+                for key, value in current.items()
+            )
+        elif isinstance(current, list):
+            stack.extend((value, path_hint) for value in current)
+
+    deduplicated: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for comment in comments:
+        user = comment.get("user") or comment.get("owner") or {}
+        key = (
+            str(comment.get("pk") or comment.get("id") or ""),
+            str(user.get("pk") or user.get("id") or user.get("username") or ""),
+            str(comment.get("created_at") or comment.get("created_at_utc") or ""),
+            str(comment.get("text") or ""),
+        )
+        if key not in seen_keys:
+            seen_keys.add(key)
+            deduplicated.append(comment)
+    return deduplicated, reached_end
+
+
 class _InstagramLikerBrowser:
     """Ambil daftar liker dari dialog web dengan satu browser per pekerjaan.
 
@@ -1657,6 +1745,161 @@ class _InstagramLikerBrowser:
             return "Sesi browser diarahkan ke halaman login."
         return ""
 
+    def lookup_comments(
+        self,
+        media,
+        expected_count: Optional[int] = None,
+    ) -> CommentLookupResult:
+        """Ambil komentar dari respons GraphQL yang benar-benar dipakai UI web."""
+        captured_responses = []
+        try:
+            self._start()
+            self._pace()
+            post_code = getattr(media, "code", "") or _media_id(media)
+            post_url = f"https://www.instagram.com/p/{post_code}/"
+
+            def is_comment_candidate(response) -> bool:
+                try:
+                    url = response.url.rstrip("/")
+                    friendly_name = str(
+                        response.request.headers.get("x-fb-friendly-name") or ""
+                    ).lower()
+                    return (
+                        url.endswith("/api/graphql")
+                        or url.endswith("/graphql/query")
+                    ) and ("comment" in friendly_name or not friendly_name)
+                except Exception:
+                    return False
+
+            def capture_response(response) -> None:
+                if is_comment_candidate(response):
+                    captured_responses.append(response)
+
+            self.page.on("response", capture_response)
+            try:
+                navigation = self.page.goto(
+                    post_url,
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                navigation_status = getattr(navigation, "status", None)
+                if navigation_status == 429:
+                    return CommentLookupResult(
+                        status="rate_limited",
+                        source="browser_web",
+                        reason="Instagram mengembalikan HTTP 429 pada halaman post.",
+                        expected_count=expected_count,
+                    )
+                redirect_reason = self._security_redirect_reason(self.page.url)
+                if navigation_status in {401, 403} or redirect_reason:
+                    return CommentLookupResult(
+                        status="unauthenticated",
+                        source="browser_web",
+                        reason=redirect_reason or f"Halaman post mengembalikan HTTP {navigation_status}.",
+                        expected_count=expected_count,
+                    )
+
+                self.page.wait_for_timeout(1_200)
+                stable_rounds = 0
+                previous_response_count = -1
+                load_text = re.compile(
+                    r"(?:view|load)\s+(?:all\s+)?(?:more\s+)?comments|"
+                    r"lihat\s+semua\s+komentar|muat\s+(?:lebih banyak\s+)?komentar",
+                    re.I,
+                )
+                aria_text = re.compile(r"load more comments|muat komentar lainnya", re.I)
+
+                for _ in range(COMMENT_BROWSER_MAX_LOADS):
+                    current_count = len(captured_responses)
+                    stable_rounds = stable_rounds + 1 if current_count == previous_response_count else 0
+                    previous_response_count = current_count
+
+                    clicked = False
+                    candidates = (
+                        self.page.get_by_label(aria_text),
+                        self.page.locator('button, [role="button"]').filter(has_text=load_text),
+                    )
+                    for candidate in candidates:
+                        try:
+                            if candidate.count() and candidate.first.is_visible():
+                                candidate.first.click(timeout=2_500)
+                                clicked = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not clicked:
+                        self.page.mouse.wheel(0, 1_200)
+                    self.page.wait_for_timeout(700)
+                    if stable_rounds >= 2 and not clicked:
+                        break
+            finally:
+                self.page.remove_listener("response", capture_response)
+
+            comments: list[dict] = []
+            reached_end = False
+            errors: list[str] = []
+            for response in captured_responses:
+                status_code = getattr(response, "status", None)
+                if status_code == 429:
+                    return CommentLookupResult(
+                        status="rate_limited",
+                        source="browser_web",
+                        reason="Endpoint komentar browser mengembalikan HTTP 429.",
+                        expected_count=expected_count,
+                    )
+                if status_code in {401, 403}:
+                    return CommentLookupResult(
+                        status="unauthenticated",
+                        source="browser_web",
+                        reason=f"Endpoint komentar browser mengembalikan HTTP {status_code}.",
+                        expected_count=expected_count,
+                    )
+                try:
+                    nodes, response_reached_end = _comment_nodes_from_payload(response.json())
+                    comments.extend(nodes)
+                    reached_end = reached_end or response_reached_end
+                except Exception as exc:
+                    errors.append(f"Respons browser tidak dapat dibaca: {type(exc).__name__}")
+
+            unique_comments, _ = _comment_nodes_from_payload(comments)
+            observed = len(unique_comments)
+            complete = bool(
+                reached_end
+                or expected_count == 0
+                or (expected_count is not None and observed >= expected_count)
+            )
+            if observed:
+                return CommentLookupResult(
+                    comments=unique_comments[:COMMENTS_PER_POST_LIMIT],
+                    status="complete" if complete else "partial",
+                    source="browser_web",
+                    reason=(
+                        "Komentar diambil dari respons GraphQL halaman post."
+                        if complete
+                        else "Sebagian komentar terbaca dari halaman post; akhir pagination belum terkonfirmasi."
+                    ),
+                    errors=errors,
+                    expected_count=expected_count,
+                    reached_end=reached_end,
+                )
+            return CommentLookupResult(
+                status="unavailable",
+                source="browser_web",
+                reason="Halaman post tidak memberikan payload komentar terstruktur.",
+                errors=errors,
+                expected_count=expected_count,
+            )
+        except Exception as exc:
+            category = _classify_instagram_exception(exc)
+            return CommentLookupResult(
+                status=category,
+                source="browser_web",
+                reason=f"Browser komentar gagal ({type(exc).__name__}).",
+                errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
+                expected_count=expected_count,
+            )
+
     def lookup(self, media, expected_count: Optional[int] = None) -> LikerLookupResult:
         """Buka dialog liked_by dengan pagination terbatas dan bukti completeness."""
         try:
@@ -1666,7 +1909,7 @@ class _InstagramLikerBrowser:
             # liked_by secara konsisten. URL ekspor tetap mengikuti tipe media.
             post_code = getattr(media, "code", "") or _media_id(media)
             post_url = f"https://www.instagram.com/p/{post_code}/"
-            navigation = self.page.goto(post_url, wait_until="domcontentloaded", timeout=45_000)
+            navigation = self.page.goto(post_url, wait_until="domcontentloaded", timeout=30_000)
             navigation_status = getattr(navigation, "status", None)
             if navigation_status == 429:
                 return LikerLookupResult(
@@ -1688,7 +1931,7 @@ class _InstagramLikerBrowser:
             # tepat setelah domcontentloaded dapat menghasilkan false negative.
             primary_liked_by_link = self.page.locator('a[href$="/liked_by/"]')
             try:
-                primary_liked_by_link.first.wait_for(state="attached", timeout=8_000)
+                primary_liked_by_link.first.wait_for(state="attached", timeout=6_000)
                 liked_by_link = primary_liked_by_link
             except Exception:
                 # Sebagian post memakai anchor ``#`` berteks "4 lainnya"
@@ -1698,7 +1941,7 @@ class _InstagramLikerBrowser:
                     has_text=re.compile(r"^\s*\d+\s+(?:lainnya|others)\s*$", re.I)
                 )
                 try:
-                    fallback_liked_by_link.first.wait_for(state="attached", timeout=3_000)
+                    fallback_liked_by_link.first.wait_for(state="attached", timeout=2_500)
                     liked_by_link = fallback_liked_by_link
                 except Exception:
                     redirect_reason = self._security_redirect_reason(self.page.url)
@@ -1952,50 +2195,64 @@ def _get_media_liker_identities(
     # saat ini dan berjalan melalui endpoint /graphql/query yang sama dengan
     # pengambilan feed/Reels.
     if getattr(cl, "_instagram_web_session", False):
-        try:
-            _sync_web_cookies(cl)
-            data = cl.public_doc_id_graphql_request(
-                MEDIA_LIKERS_WEB_DOC_ID,
-                {"media_id": media_pk},
-                referer=get_instagram_media_url(media),
-                headers={"X-FB-Friendly-Name": "PolarisPostLikedByListDialogQuery"},
-            )
-            media_node = (data or {}).get("fetch__XDTMediaDict") or {}
-            connection = media_node.get("likers_connection")
-            if connection is not None:
-                web_likers = _liker_connection_nodes(connection)
-                usernames, user_ids = _liker_identity_sets(web_likers)
-                page_info = connection.get("page_info") or {}
-                attempts.append(
-                    _liker_result_from_identities(
-                        usernames,
-                        user_ids,
-                        source="web_graphql",
-                        expected_count=post_likes,
-                        reached_end=page_info.get("has_next_page") is False,
-                        connection_total=_liker_connection_total(connection),
-                    )
-                )
-            else:
-                attempts.append(
-                    LikerLookupResult(
-                        status="unavailable",
-                        source="web_graphql",
-                        reason="GraphQL Web tidak menyediakan likers_connection.",
-                        expected_count=post_likes,
-                    )
-                )
-        except Exception as exc:
-            _raise_if_terminal_instagram_error(exc, "mengambil daftar liker melalui GraphQL Web")
+        web_graphql_disabled = bool(
+            getattr(cl, "_instagram_liker_web_graphql_disabled", False)
+        )
+        if web_graphql_disabled:
             attempts.append(
                 LikerLookupResult(
-                    status="error",
+                    status="unavailable",
                     source="web_graphql",
-                    reason="GraphQL Web gagal mengambil daftar liker.",
-                    errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
+                    reason="GraphQL Web liker dinonaktifkan untuk job ini setelah connection tidak tersedia.",
                     expected_count=post_likes,
                 )
             )
+        else:
+            try:
+                _sync_web_cookies(cl)
+                data = cl.public_doc_id_graphql_request(
+                    MEDIA_LIKERS_WEB_DOC_ID,
+                    {"media_id": media_pk},
+                    referer=get_instagram_media_url(media),
+                    headers={"X-FB-Friendly-Name": "PolarisPostLikedByListDialogQuery"},
+                )
+                media_node = (data or {}).get("fetch__XDTMediaDict") or {}
+                connection = media_node.get("likers_connection")
+                if connection is not None:
+                    web_likers = _liker_connection_nodes(connection)
+                    usernames, user_ids = _liker_identity_sets(web_likers)
+                    page_info = connection.get("page_info") or {}
+                    attempts.append(
+                        _liker_result_from_identities(
+                            usernames,
+                            user_ids,
+                            source="web_graphql",
+                            expected_count=post_likes,
+                            reached_end=page_info.get("has_next_page") is False,
+                            connection_total=_liker_connection_total(connection),
+                        )
+                    )
+                else:
+                    setattr(cl, "_instagram_liker_web_graphql_disabled", True)
+                    attempts.append(
+                        LikerLookupResult(
+                            status="unavailable",
+                            source="web_graphql",
+                            reason="GraphQL Web tidak menyediakan likers_connection.",
+                            expected_count=post_likes,
+                        )
+                    )
+            except Exception as exc:
+                _raise_if_terminal_instagram_error(exc, "mengambil daftar liker melalui GraphQL Web")
+                attempts.append(
+                    LikerLookupResult(
+                        status="error",
+                        source="web_graphql",
+                        reason="GraphQL Web gagal mengambil daftar liker.",
+                        errors=[f"{type(exc).__name__}: {str(exc)[:160]}"],
+                        expected_count=post_likes,
+                    )
+                )
 
         if attempts and attempts[-1].complete:
             cache[cache_key] = attempts[-1]
@@ -2089,9 +2346,24 @@ def get_comments_from_post(
     comment_errors: list[str] = []
     successful_comment_request = False
     comment_source = "none"
+    source_state = getattr(cl, "_instagram_comment_source_state", None)
+    if not isinstance(source_state, dict):
+        source_state = {
+            "graphql_failures": 0,
+            "graphql_disabled": False,
+            "browser_failures": 0,
+            "browser_disabled": False,
+        }
+        setattr(cl, "_instagram_comment_source_state", source_state)
+
     # Endpoint kosong belum tentu error (post memang dapat tidak memiliki
     # komentar), sehingga fallback dicoba tanpa menghapus diagnostik error.
-    comment_methods = [("graphql", getattr(cl, "media_comments_gql", None))]
+    comment_methods = []
+    if not (
+        getattr(cl, "_instagram_web_session", False)
+        and source_state.get("graphql_disabled")
+    ):
+        comment_methods.append(("graphql", getattr(cl, "media_comments_gql", None)))
     if not getattr(cl, "_instagram_web_session", False):
         comment_methods.append(("private_api", getattr(cl, "media_comments", None)))
     for source, method in comment_methods:
@@ -2104,8 +2376,18 @@ def get_comments_from_post(
             if candidate_comments:
                 media_comments = list(candidate_comments)
                 comment_source = source
+                if source == "graphql":
+                    source_state["graphql_failures"] = 0
                 break
             comment_source = source
+            if (
+                source == "graphql"
+                and getattr(cl, "_instagram_web_session", False)
+                and expected_comment_count
+            ):
+                source_state["graphql_failures"] += 1
+                if source_state["graphql_failures"] >= COMMENT_SOURCE_FAILURE_LIMIT:
+                    source_state["graphql_disabled"] = True
             # Respons kosong adalah hasil final bila metadata juga nol/tidak
             # tersedia. Fallback tambahan hanya layak bila ada bukti komentar.
             if expected_comment_count in {None, 0}:
@@ -2113,11 +2395,65 @@ def get_comments_from_post(
         except Exception as exc:
             _raise_if_terminal_instagram_error(exc, f"mengambil komentar post {post_code}")
             comment_errors.append(f"{source}: {type(exc).__name__}: {str(exc)[:160]}")
+            if source == "graphql" and getattr(cl, "_instagram_web_session", False):
+                source_state["graphql_failures"] += 1
+                if source_state["graphql_failures"] >= COMMENT_SOURCE_FAILURE_LIMIT:
+                    source_state["graphql_disabled"] = True
+
+    # Sesi browser tidak boleh mencoba endpoint mobile. Bila query GraphQL
+    # statis gagal/berubah, ambil payload yang benar-benar digunakan halaman.
+    should_try_browser = (
+        not media_comments
+        and getattr(cl, "_instagram_web_session", False)
+        and liker_browser is not None
+        and not source_state.get("browser_disabled")
+        and (bool(expected_comment_count) or bool(comment_errors))
+    )
+    if should_try_browser:
+        browser_result = liker_browser.lookup_comments(
+            media,
+            expected_count=expected_comment_count,
+        )
+        comment_errors.extend(browser_result.errors)
+        if browser_result.status == "rate_limited":
+            raise InstagramRateLimitError(browser_result.reason)
+        if browser_result.status == "unauthenticated":
+            raise InstagramAuthenticationError(browser_result.reason)
+        if browser_result.comments:
+            media_comments = list(browser_result.comments)
+            comment_source = browser_result.source
+            successful_comment_request = True
+            source_state["browser_failures"] = 0
+        else:
+            source_state["browser_failures"] += 1
+            comment_errors.append(
+                f"{browser_result.source}: {browser_result.reason or browser_result.status}"
+            )
+            if source_state["browser_failures"] >= COMMENT_SOURCE_FAILURE_LIMIT:
+                source_state["browser_disabled"] = True
 
     if not media_comments:
         expected_comments_missing = bool(expected_comment_count and expected_comment_count > 0)
         if not successful_comment_request or expected_comments_missing:
-            setattr(cl, "_last_comment_lookup", {"ok": False, "source": "none", "errors": comment_errors})
+            disabled_sources = [
+                name
+                for name in ("graphql", "browser")
+                if source_state.get(f"{name}_disabled")
+            ]
+            setattr(
+                cl,
+                "_last_comment_lookup",
+                {
+                    "ok": False,
+                    "source": comment_source,
+                    "status": "failed",
+                    "complete": False,
+                    "expected_count": expected_comment_count,
+                    "observed_count": 0,
+                    "errors": comment_errors,
+                    "disabled_sources": disabled_sources,
+                },
+            )
             count_detail = (
                 f"; metadata post menyebut {expected_comment_count} komentar tetapi endpoint mengembalikan kosong"
                 if expected_comments_missing
@@ -2207,7 +2543,7 @@ def get_comments_from_post(
     for comment in media_comments:
         # Parsing data komentar, menangani dict GraphQL maupun objek Comment.
         if isinstance(comment, dict):
-            user_obj = comment.get("user") or {}
+            user_obj = comment.get("user") or comment.get("owner") or {}
             if isinstance(user_obj, dict):
                 raw_commenter_username = user_obj.get("username")
                 commenter_user = raw_commenter_username or user_obj.get("id") or "unknown"
@@ -2294,7 +2630,7 @@ def get_comments_from_post(
             "post_url": post_url,
             "post_likes": post_likes,
             "post_date": taken_at_str,
-            "post_caption": (caption[:100] + "...") if caption and len(caption) > 100 else caption,
+            "post_caption": caption,
             "comment_lookup_status": comment_lookup_status,
             "comment_lookup_reason": comment_lookup_reason,
             "post_comment_count_expected": expected_comment_count,
@@ -2382,10 +2718,25 @@ def get_all_comments(
                 consecutive_comment_failures += 1
                 error_item = {"post": str(post_code), "error": str(exc)}
                 job_diagnostics["comment_errors"].append(error_item)
-                if consecutive_comment_failures >= COMMENT_FETCH_FAILURE_LIMIT:
+                circuit_just_opened = (
+                    consecutive_comment_failures >= COMMENT_FETCH_FAILURE_LIMIT
+                    and not job_diagnostics["comment_circuit_open"]
+                )
+                if circuit_just_opened:
+                    source_state = getattr(cl, "_instagram_comment_source_state", {}) or {}
+                    disabled_sources = [
+                        name
+                        for name in ("graphql", "browser")
+                        if source_state.get(f"{name}_disabled")
+                    ]
+                    source_detail = (
+                        f" Sumber nonaktif: {', '.join(disabled_sources)}."
+                        if disabled_sources
+                        else ""
+                    )
                     circuit_reason = (
-                        f"Pengambilan komentar dihentikan setelah {consecutive_comment_failures} kegagalan beruntun "
-                        "untuk mencegah request berulang ke Instagram."
+                        f"Terdapat {consecutive_comment_failures} kegagalan komentar beruntun."
+                        f"{source_detail} Post berikutnya tetap diperiksa melalui sumber yang masih tersedia."
                     )
                     job_diagnostics["comment_circuit_open"] = True
                     job_diagnostics["comment_circuit_reason"] = circuit_reason
@@ -2397,7 +2748,6 @@ def get_all_comments(
                             len(all_comments),
                             circuit_reason,
                         )
-                    break
                 if progress_callback:
                     progress_callback(
                         i + 1,

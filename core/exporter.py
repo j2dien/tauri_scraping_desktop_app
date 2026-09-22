@@ -27,6 +27,18 @@ BULAN_INDONESIA = [
     "Juli", "Agustus", "September", "Oktober", "November", "Desember",
 ]
 
+INSTAGRAM_DETAIL_HEADERS = [
+    "Username",
+    "Teks Komentar",
+    "Sudah Like Post?",
+    "Like Komentar",
+    "Tanggal Komentar",
+    "Post URL",
+    "Like Postingan",
+    "Tanggal Post",
+    "Caption Post",
+]
+
 
 def clean_cell_value(val: Any) -> Any:
     """Bersihkan karakter ilegal dan cegah teks user dieksekusi sebagai formula."""
@@ -220,6 +232,11 @@ def export_to_excel(
     elif isinstance(detail_comments, list):
         comments_list = detail_comments
 
+    # Untuk Instagram, sheet data harus memuat seluruh komentar yang berhasil
+    # discrape, bukan hanya detail milik user yang masuk peringkat top-N.
+    if platform.strip().lower() == "instagram" and isinstance(all_comments, list):
+        comments_list = list(all_comments)
+
     # Bersihkan nama file default jika belum ada
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -381,56 +398,82 @@ def export_to_excel(
     # ── Sheet 2: Detail Komentar ──────────────────────────────────────
     ws_detail = wb.create_sheet("Detail Komentar")
 
-    detail_headers = [
-        "Username",
-        "Teks Komentar",
-        "Sudah Like Post?",
-        "Status Pemeriksaan Like",
-        "Sumber Pemeriksaan",
-        "Alasan/Detail",
-        "Liker Terbaca",
-        "Daftar Liker Lengkap?",
-        "Namespace Username Lengkap?",
-        "Namespace User ID Lengkap?",
-        "Like Komentar",
-        "Tanggal Komentar",
-        "Post URL",
-        "Like Postingan",
-        "Tanggal Post",
-        "Caption Post",
-    ]
+    instagram_detail = platform.strip().lower() == "instagram"
+    if instagram_detail:
+        detail_headers = list(INSTAGRAM_DETAIL_HEADERS)
+    else:
+        detail_headers = [
+            "Username",
+            "Teks Komentar",
+            "Sudah Like Post?",
+            "Status Pemeriksaan Like",
+            "Sumber Pemeriksaan",
+            "Alasan/Detail",
+            "Liker Terbaca",
+            "Daftar Liker Lengkap?",
+            "Namespace Username Lengkap?",
+            "Namespace User ID Lengkap?",
+            "Like Komentar",
+            "Tanggal Komentar",
+            "Post URL",
+            "Like Postingan",
+            "Tanggal Post",
+            "Caption Post",
+        ]
     _style_header(ws_detail, detail_headers, fill_color="2E75B6")
     detail_col_count = len(detail_headers)
 
     for i, comment in enumerate(comments_list):
         row = i + 2
-        ws_detail.cell(row=row, column=1, value=clean_cell_value(comment.get("commenter_username", "unknown")))
-        ws_detail.cell(row=row, column=2, value=clean_cell_value(comment.get("comment_text", "")))
-        ws_detail.cell(row=row, column=3, value=clean_cell_value(comment.get("has_liked_post", "N/A")))
-        ws_detail.cell(row=row, column=4, value=_lookup_status_for_excel(comment.get("like_lookup_status")))
-        ws_detail.cell(row=row, column=5, value=clean_cell_value(comment.get("like_lookup_source", "")))
-        ws_detail.cell(row=row, column=6, value=clean_cell_value(comment.get("like_lookup_reason", "")))
-        ws_detail.cell(
-            row=row,
-            column=7,
-            value=_optional_count_for_excel(comment.get("liker_count_observed")),
-        )
-        lookup_complete = comment.get("liker_lookup_complete")
-        ws_detail.cell(row=row, column=8, value=_boolean_for_excel(lookup_complete))
-        ws_detail.cell(row=row, column=9, value=_boolean_for_excel(comment.get("liker_usernames_complete")))
-        ws_detail.cell(row=row, column=10, value=_boolean_for_excel(comment.get("liker_user_ids_complete")))
-        ws_detail.cell(row=row, column=11, value=_optional_count_for_excel(comment.get("comment_likes")))
-        ws_detail.cell(row=row, column=12, value=clean_cell_value(format_tanggal_indonesia(comment.get("comment_date", "N/A"))))
-        ws_detail.cell(row=row, column=13, value=clean_cell_value(comment.get("post_url", "")))
-        ws_detail.cell(row=row, column=14, value=_optional_count_for_excel(comment.get("post_likes")))
-        ws_detail.cell(row=row, column=15, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
-        ws_detail.cell(row=row, column=16, value=clean_cell_value(comment.get("post_caption", "")))
+        if instagram_detail:
+            values = [
+                comment.get("commenter_username", "unknown"),
+                comment.get("comment_text", ""),
+                comment.get("has_liked_post", "N/A"),
+                _optional_count_for_excel(comment.get("comment_likes")),
+                format_tanggal_indonesia(comment.get("comment_date", "N/A")),
+                comment.get("post_url", ""),
+                _optional_count_for_excel(comment.get("post_likes")),
+                format_tanggal_indonesia(comment.get("post_date", "N/A")),
+                comment.get("post_caption", ""),
+            ]
+            for column, value in enumerate(values, 1):
+                ws_detail.cell(row=row, column=column, value=clean_cell_value(value))
+        else:
+            ws_detail.cell(row=row, column=1, value=clean_cell_value(comment.get("commenter_username", "unknown")))
+            ws_detail.cell(row=row, column=2, value=clean_cell_value(comment.get("comment_text", "")))
+            ws_detail.cell(row=row, column=3, value=clean_cell_value(comment.get("has_liked_post", "N/A")))
+            ws_detail.cell(row=row, column=4, value=_lookup_status_for_excel(comment.get("like_lookup_status")))
+            ws_detail.cell(row=row, column=5, value=clean_cell_value(comment.get("like_lookup_source", "")))
+            ws_detail.cell(row=row, column=6, value=clean_cell_value(comment.get("like_lookup_reason", "")))
+            ws_detail.cell(
+                row=row,
+                column=7,
+                value=_optional_count_for_excel(comment.get("liker_count_observed")),
+            )
+            lookup_complete = comment.get("liker_lookup_complete")
+            ws_detail.cell(row=row, column=8, value=_boolean_for_excel(lookup_complete))
+            ws_detail.cell(row=row, column=9, value=_boolean_for_excel(comment.get("liker_usernames_complete")))
+            ws_detail.cell(row=row, column=10, value=_boolean_for_excel(comment.get("liker_user_ids_complete")))
+            ws_detail.cell(row=row, column=11, value=_optional_count_for_excel(comment.get("comment_likes")))
+            ws_detail.cell(row=row, column=12, value=clean_cell_value(format_tanggal_indonesia(comment.get("comment_date", "N/A"))))
+            ws_detail.cell(row=row, column=13, value=clean_cell_value(comment.get("post_url", "")))
+            ws_detail.cell(row=row, column=14, value=_optional_count_for_excel(comment.get("post_likes")))
+            ws_detail.cell(row=row, column=15, value=clean_cell_value(format_tanggal_indonesia(comment.get("post_date", "N/A"))))
+            ws_detail.cell(row=row, column=16, value=clean_cell_value(comment.get("post_caption", "")))
 
         if i % 2 == 1:
             for col in range(1, detail_col_count + 1):
                 ws_detail.cell(row=row, column=col).fill = data_fill_even
 
     _auto_fit_columns(ws_detail)
+    if instagram_detail:
+        ws_detail.column_dimensions["B"].width = 45
+        ws_detail.column_dimensions["F"].width = 42
+        ws_detail.column_dimensions["I"].width = 55
+        for row in ws_detail.iter_rows(min_row=2, max_col=detail_col_count):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
 
     # ── Sheet 3: Daftar Postingan ─────────────────────────────────────
     ws_posts = wb.create_sheet("Daftar Postingan")

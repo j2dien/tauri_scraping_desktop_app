@@ -380,7 +380,6 @@ async def run_analysis(req: AnalyzeRequest):
 
                 def on_ig_login_log(msg: str):
                     check_cancelled()
-                    sync_broadcast("status", msg)
                     sync_broadcast("log", msg)
 
                 # 1. Login via Cookie Session ID jika disediakan
@@ -419,7 +418,6 @@ async def run_analysis(req: AnalyzeRequest):
                 def on_ig_post_log(msg: Any):
                     check_cancelled()
                     if isinstance(msg, str):
-                        sync_broadcast("status", msg)
                         sync_broadcast("log", msg)
                     else:
                         post_date = msg.taken_at.strftime("%d-%m-%Y %H:%M") if hasattr(msg, 'taken_at') and msg.taken_at else ""
@@ -451,8 +449,6 @@ async def run_analysis(req: AnalyzeRequest):
                         "total": total,
                         "count": total_comms
                     })
-                    if msg_text:
-                        sync_broadcast("log", msg_text)
 
                 try:
                     all_comments = get_ig_comments(cl, posts, progress_callback=on_ig_comm_progress)
@@ -491,7 +487,7 @@ async def run_analysis(req: AnalyzeRequest):
                         "post_url": get_instagram_media_url(p),
                         "post_likes": getattr(p, "like_count", None),
                         "post_date": taken_at_str,
-                        "post_caption": (caption[:100] + "...") if caption and len(caption) > 100 else caption,
+                        "post_caption": caption,
                     })
 
             # Kirim hasil lengkap ke frontend

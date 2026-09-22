@@ -208,6 +208,45 @@ class OptionalCountTests(unittest.TestCase):
         self.assertEqual(scraper._optional_count("2 jt"), 2_000_000)
 
 
+class CommentPayloadExtractionTests(unittest.TestCase):
+    def test_extracts_and_deduplicates_comment_nodes_from_dynamic_connection(self):
+        node = {
+            "id": "comment-1",
+            "text": "halo",
+            "owner": {"id": "user-1", "username": "alice"},
+            "created_at": 1_700_000_000,
+            "like_count": 2,
+        }
+        payload = {
+            "data": {
+                "xdt_new_comment_connection_name": {
+                    "edges": [{"node": node}, {"node": dict(node)}],
+                    "page_info": {"has_next_page": False},
+                }
+            }
+        }
+
+        comments, reached_end = scraper._comment_nodes_from_payload(payload)
+
+        self.assertEqual(comments, [node])
+        self.assertTrue(reached_end)
+
+    def test_unrelated_page_info_does_not_prove_comment_pagination_complete(self):
+        payload = {
+            "data": {
+                "feed_connection": {
+                    "page_info": {"has_next_page": False},
+                    "edges": [],
+                }
+            }
+        }
+
+        comments, reached_end = scraper._comment_nodes_from_payload(payload)
+
+        self.assertEqual(comments, [])
+        self.assertFalse(reached_end)
+
+
 class OEmbedSafetyTests(unittest.TestCase):
     class Response:
         def raise_for_status(self):
@@ -550,6 +589,46 @@ class CommentResultSafetyTests(unittest.TestCase):
 
         self.assertEqual(calls, ["graphql"])
 
+    def test_web_session_uses_browser_comment_fallback_after_graphql_decode_failure(self):
+        calls = []
+
+        def gql(*_args, **_kwargs):
+            calls.append("graphql")
+            raise RuntimeError("ClientJSONDecodeError")
+
+        browser = SimpleNamespace(
+            lookup_comments=lambda *_args, **_kwargs: scraper.CommentLookupResult(
+                comments=[
+                    {
+                        "id": "comment-1",
+                        "user": {"username": "alice", "id": "user-1"},
+                        "text": "berhasil dari browser",
+                        "created_at": 1_700_000_000,
+                    }
+                ],
+                status="complete",
+                source="browser_web",
+                expected_count=1,
+                reached_end=True,
+            )
+        )
+        client = SimpleNamespace(
+            _instagram_web_session=True,
+            media_comments_gql=gql,
+            media_comments=lambda *_args, **_kwargs: calls.append("private") or [],
+        )
+
+        result = scraper.get_comments_from_post(
+            client,
+            self.media(comment_count=1),
+            fetch_likers=False,
+            liker_browser=browser,
+        )
+
+        self.assertEqual(calls, ["graphql"])
+        self.assertEqual(result[0]["comment_text"], "berhasil dari browser")
+        self.assertEqual(client._last_comment_lookup["source"], "browser_web")
+
     def test_comment_cap_is_exposed_as_partial_diagnostics(self):
         comments = [
             {"user": {"username": f"user{index}"}, "text": "hello"}
@@ -579,7 +658,7 @@ class JobCircuitBreakerTests(unittest.TestCase):
             for index in range(count)
         ]
 
-    def test_comment_failures_stop_job_after_three_attempts(self):
+    def test_comment_failures_mark_partial_but_all_posts_are_considered(self):
         client = SimpleNamespace(_instagram_web_session=False)
         failure = scraper.InstagramCommentFetchError("endpoint komentar gagal")
 
@@ -587,9 +666,10 @@ class JobCircuitBreakerTests(unittest.TestCase):
             result = scraper.get_all_comments(client, self.posts(5))
 
         self.assertEqual(result, [])
-        self.assertEqual(mocked.call_count, scraper.COMMENT_FETCH_FAILURE_LIMIT)
+        self.assertEqual(mocked.call_count, 5)
         diagnostics = client._instagram_job_diagnostics
         self.assertTrue(diagnostics["comment_circuit_open"])
+        self.assertEqual(len(diagnostics["comment_errors"]), 5)
 
     def test_liker_failures_open_circuit_but_comments_continue(self):
         client = SimpleNamespace(_instagram_web_session=False)
