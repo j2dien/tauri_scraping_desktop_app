@@ -219,7 +219,8 @@ def _no_interactive_challenge(username: str, choice=None):
     """Handler non-blocking saat Instagram meminta verifikasi Challenge/2FA."""
     raise LoginRequiredError(
         f"Akun @{username} memerlukan verifikasi keamanan (Challenge/2FA via {choice or 'SMS/Email/Aplikasi'}).\n"
-        "Silakan buka aplikasi Instagram di ponsel Anda, setujui konfirmasi 'Ini Saya', lalu coba lagi."
+        "Buka akun melalui aplikasi atau browser dan selesaikan petunjuk yang muncul. "
+        "Instagram tidak selalu mengirim notifikasi 'Ini Saya'."
     )
 
 
@@ -288,6 +289,114 @@ def _configure_web_session(cl: Client, sessionid: str, extra_cookies=None) -> st
     return owner_id
 
 
+def _validate_viewer_identity(
+    cl: Client,
+    owner_id: str,
+    expected_username: str,
+    viewer_id: Any,
+    viewer_username: Any,
+) -> bool:
+    """Cocokkan identitas sesi tanpa menyimpan data privat lain dari akun."""
+    normalized_id = str(viewer_id or "").strip()
+    normalized_username = str(viewer_username or "").strip().lower()
+    if not normalized_id or normalized_id != owner_id or not normalized_username:
+        return False
+
+    expected = expected_username.replace("@", "").strip().lower()
+    if expected and normalized_username != expected:
+        raise InstagramAuthenticationError(
+            f"Cookie Session ID milik @{normalized_username}, bukan @{expected}. "
+            "Gunakan username akun pemilik cookie, bukan username target scraping."
+        )
+
+    setattr(
+        cl,
+        "_instagram_viewer_identity",
+        {"id": normalized_id, "username": normalized_username},
+    )
+    return True
+
+
+def _validate_web_session_via_account_form(
+    cl: Client,
+    owner_id: str,
+    expected_username: str,
+) -> Optional[bool]:
+    """Validasi cookie lewat halaman privat akun; None berarti coba fallback GraphQL.
+
+    Endpoint ini hanya mengembalikan ``form_data`` untuk browser yang sudah
+    terautentikasi. Kita hanya membaca ID/username dan tidak menyimpan email,
+    nomor telepon, atau field privat lain dari respons.
+    """
+    request = getattr(getattr(cl, "public", None), "get", None)
+    if not callable(request):
+        return None
+
+    try:
+        response = request(
+            "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
+            headers={
+                "Accept": "*/*",
+                "Referer": "https://www.instagram.com/accounts/edit/",
+                "User-Agent": getattr(cl, "public_user_agent", ""),
+                "X-IG-App-ID": "936619743392459",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=min(int(getattr(cl, "request_timeout", 20) or 20), 20),
+        )
+    except Exception as exc:
+        _raise_if_terminal_instagram_error(exc, "memvalidasi Cookie Session ID melalui halaman akun")
+        return None
+
+    status_code = _optional_count(getattr(response, "status_code", None))
+    if status_code == 429:
+        raise InstagramRateLimitError(
+            "Instagram membatasi validasi Cookie Session ID (HTTP 429). Hentikan percobaan dan tunggu."
+        )
+    if status_code in {401, 403}:
+        return False
+    if status_code is not None and status_code >= 400:
+        return None
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    message = str(payload.get("message") or payload.get("error_type") or "").strip()
+    message_category = _classify_instagram_exception(RuntimeError(message)) if message else "error"
+    if message_category == "rate_limited":
+        raise InstagramRateLimitError(
+            "Instagram membatasi validasi Cookie Session ID. Hentikan percobaan dan tunggu."
+        )
+    if message_category == "unauthenticated":
+        # ``login_required`` adalah penolakan sesi yang definitif. Challenge
+        # perlu ditampilkan sebagai kondisi keamanan, bukan cookie kedaluwarsa.
+        lowered_message = message.lower()
+        if "challenge" in lowered_message or "checkpoint" in lowered_message:
+            raise InstagramAuthenticationError(
+                "Cookie diterima, tetapi Instagram meminta challenge/checkpoint pada sesi browser tersebut."
+            )
+        return False
+
+    form_data = payload.get("form_data")
+    if not isinstance(form_data, dict) or not form_data.get("username"):
+        return None
+
+    # Sebagian varian respons tidak mengirim ID. Karena endpoint privat ini
+    # sudah membuktikan cookie aktif, gunakan prefix sessionid sebagai owner ID.
+    viewer_id = form_data.get("id") or form_data.get("pk") or owner_id
+    return _validate_viewer_identity(
+        cl,
+        owner_id,
+        expected_username,
+        viewer_id,
+        form_data.get("username"),
+    )
+
+
 def _validate_web_session(cl: Client, expected_username: str = "") -> bool:
     """Validasi cookie dan cocokkan identitas viewer dengan pemilik sessionid."""
     sessionid = getattr(cl, "sessionid", "") or ""
@@ -296,6 +405,15 @@ def _validate_web_session(cl: Client, expected_username: str = "") -> bool:
         return False
 
     _sync_web_cookies(cl)
+    account_form_result = _validate_web_session_via_account_form(
+        cl,
+        owner_id,
+        expected_username,
+    )
+    if account_form_result is not None:
+        return account_form_result
+
+    # Fallback untuk instalasi/region yang tidak menyediakan web_form_data.
     data = cl.public_doc_id_graphql_request(
         REELS_WEB_DOC_ID,
         {
@@ -316,29 +434,13 @@ def _validate_web_session(cl: Client, expected_username: str = "") -> bool:
     if not isinstance(viewer_user, dict) or not viewer_user:
         return False
 
-    viewer_id = str(viewer_user.get("pk") or viewer_user.get("id") or "")
-    viewer_username = str(viewer_user.get("username") or "").strip().lower()
-    setattr(
+    return _validate_viewer_identity(
         cl,
-        "_instagram_viewer_identity",
-        {"id": viewer_id, "username": viewer_username},
+        owner_id,
+        expected_username,
+        viewer_user.get("pk") or viewer_user.get("id"),
+        viewer_user.get("username"),
     )
-
-    # Identitas kosong tidak cukup menjadi bukti login. Prefix sessionid juga
-    # harus sama dengan viewer agar cookie dari akun berbeda tidak tertukar.
-    if not viewer_id or viewer_id != owner_id:
-        return False
-
-    expected = expected_username.replace("@", "").strip().lower()
-    if expected:
-        if not viewer_username:
-            return False
-        if viewer_username != expected:
-            raise InstagramAuthenticationError(
-                f"Cookie Session ID milik @{viewer_username}, bukan @{expected}. "
-                "Gunakan username yang sesuai dengan cookie tersebut."
-            )
-    return True
 
 
 def _login_instagram_web(
@@ -412,7 +514,8 @@ def _login_instagram_web(
         )
     if result.get("checkpoint_url") or result.get("checkpoint_required"):
         raise LoginRequiredError(
-            "Instagram meminta checkpoint keamanan. Konfirmasi 'Ini Saya' di aplikasi Instagram, lalu coba lagi."
+            "Instagram menolak login otomatis dengan status checkpoint. Notifikasi 'Ini Saya' tidak selalu muncul. "
+            "Login melalui browser, selesaikan verifikasi jika ada, lalu gunakan Cookie Session ID terbaru."
         )
     if not result.get("authenticated"):
         message = result.get("message") or result.get("error_type") or "autentikasi ditolak"
@@ -979,9 +1082,9 @@ def login_instagram(
             raise LoginRequiredError(
                 f"Instagram meminta verifikasi Challenge untuk @{clean_user}.\n"
                 "Langkah penyelesaian:\n"
-                "1. Buka aplikasi Instagram di ponsel Anda dan konfirmasi 'Ini Saya'.\n"
-                "2. Klik 'Mulai Scraping & Analisis' kembali di aplikasi ini (identitas perangkat telah tersimpan).\n"
-                "Atau gunakan Cookie Session ID terbaru dari browser Chrome/Edge yang sudah terautentikasi."
+                "1. Login melalui aplikasi atau browser pada akun tersebut.\n"
+                "2. Selesaikan petunjuk keamanan jika muncul; notifikasi 'Ini Saya' tidak selalu tersedia.\n"
+                "3. Gunakan Cookie Session ID terbaru dari Chrome/Edge yang sudah terautentikasi."
             )
 
         if "bad_password" in err_lower or "password" in err_lower:

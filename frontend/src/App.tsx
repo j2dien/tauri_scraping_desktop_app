@@ -807,7 +807,7 @@ export default function App(): React.JSX.Element {
                     </div>
                   )}
                   <span style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.4' }}>
-                    📱 Jika muncul permintaan konfirmasi di HP, buka aplikasi Instagram, ketuk <b>'Ini Saya'</b>, lalu klik tombol 'Mulai Scraping' lagi.
+                    Login password otomatis dapat ditolak tanpa notifikasi. Jika terjadi checkpoint, login melalui browser lalu gunakan <b>Cookie Session ID</b> terbaru.
                   </span>
                 </div>
               ) : (
@@ -815,7 +815,7 @@ export default function App(): React.JSX.Element {
                   <input
                     type="text"
                     className="custom-input"
-                    placeholder="Username Instagram Anda (opsional)"
+                    placeholder="Username akun pemilik cookie (disarankan)"
                     value={igUser}
                     onChange={(e) => setIgUser(e.target.value)}
                   />
@@ -848,6 +848,7 @@ export default function App(): React.JSX.Element {
                         <li>Buka <b>instagram.com</b> di browser Chrome/Edge dan pastikan sudah login.</li>
                         <li>Tekan <b>F12</b> (Inspect Element), buka tab <b>Application</b> (atau Storage).</li>
                         <li>Cari nama <b>sessionid</b>, klik dua kali nilainya, copy, lalu paste di kotak di atas.</li>
+                        <li>Isi username dengan akun pemilik cookie, bukan akun target scraping.</li>
                       </ol>
                     </div>
                   )}
@@ -962,7 +963,9 @@ export default function App(): React.JSX.Element {
               </div>
             )}
 
-            {(statusMessage.toLowerCase().includes('ini saya') || statusMessage.toLowerCase().includes('challenge')) && (
+            {(statusMessage.toLowerCase().includes('ini saya')
+              || statusMessage.toLowerCase().includes('challenge')
+              || statusMessage.toLowerCase().includes('checkpoint')) && (
               <div style={{
                 background: 'rgba(236, 72, 153, 0.12)',
                 border: '1.5px solid var(--accent-pink)',
@@ -977,11 +980,11 @@ export default function App(): React.JSX.Element {
                 <span style={{ fontSize: '24px' }}>📱</span>
                 <div style={{ fontSize: '12px', color: 'var(--text-primary)', lineHeight: '1.4' }}>
                   <b style={{ color: 'var(--accent-pink)', display: 'block', marginBottom: '2px' }}>
-                    Instagram Memerlukan Konfirmasi 'Ini Saya'
+                    Login Otomatis Ditolak Instagram
                   </b>
-                  1. Buka aplikasi Instagram di ponsel Anda.<br />
-                  2. Ketuk notifikasi atau banner keamanan, lalu pilih <b>'Ini Saya'</b> (This Was Me).<br />
-                  3. Setelah konfirmasi selesai, klik tombol <b>'Mulai Scraping &amp; Analisis'</b> kembali di aplikasi ini.<br />
+                  1. Login ke Instagram melalui aplikasi atau browser pada akun tersebut.<br />
+                  2. Selesaikan petunjuk keamanan jika muncul; notifikasi <b>'Ini Saya'</b> tidak selalu tersedia.<br />
+                  3. Ambil Cookie Session ID terbaru dari browser yang sudah login, lalu gunakan mode Cookie Session ID.<br />
                   <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
                     💡 Session ID bukan cara melewati pemeriksaan keamanan; Instagram tetap dapat meminta verifikasi.
                   </span>

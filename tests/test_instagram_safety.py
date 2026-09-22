@@ -293,6 +293,49 @@ class SessionIdentityTests(unittest.TestCase):
 
         self.assertFalse(scraper._validate_web_session(client, expected_username="alice"))
 
+    def make_web_form_client(self, payload, status_code=200):
+        client = self.make_client(None)
+
+        class Response:
+            def json(self):
+                return payload
+
+        response = Response()
+        response.status_code = status_code
+        client.public.get = lambda *args, **kwargs: response
+        client.public_user_agent = "test-agent"
+        client.request_timeout = 20
+        client.public_doc_id_graphql_request = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("GraphQL fallback tidak boleh dipanggil untuk hasil definitif")
+        )
+        return client
+
+    def test_account_form_can_validate_active_session_without_xdt_viewer(self):
+        client = self.make_web_form_client(
+            {"form_data": {"username": "alice"}}
+        )
+
+        self.assertTrue(scraper._validate_web_session(client, expected_username="alice"))
+        self.assertEqual(
+            client._instagram_viewer_identity,
+            {"id": "12345", "username": "alice"},
+        )
+
+    def test_account_form_username_must_match_login_account(self):
+        client = self.make_web_form_client(
+            {"form_data": {"username": "bob"}}
+        )
+
+        with self.assertRaises(scraper.InstagramAuthenticationError):
+            scraper._validate_web_session(client, expected_username="alice")
+
+    def test_account_form_login_required_is_definitive(self):
+        client = self.make_web_form_client(
+            {"message": "login_required", "status": "fail"}
+        )
+
+        self.assertFalse(scraper._validate_web_session(client, expected_username="alice"))
+
 
 class ZeroPostLikeShortcutTests(unittest.TestCase):
     class RecordingClient:
