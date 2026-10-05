@@ -519,15 +519,19 @@ def export_results(req: ExportRequest):
     try:
         date_str = re.sub(r"[^0-9_]", "", f"{req.start_date}_{req.end_date}".replace("-", ""))
         safe_plat = re.sub(r"[^\w-]", "_", req.platform.lower()).strip("_-") or "platform"
+        raw_user = req.target_username.strip()
+        url_match = re.search(r"(?:instagram\.com|tiktok\.com)/@?([^/?#]+)", raw_user, re.I)
+        if url_match:
+            raw_user = url_match.group(1)
         safe_user = re.sub(
-            r"[^\w-]",
+            r"[^\w.-]",
             "_",
-            req.target_username.replace("@", "").strip(),
-        ).strip("_-") or "target"
+            raw_user.replace("@", "").strip(),
+        ).strip("_-.") or "target"
         default_name = (
             Path(req.filename).name
             if req.filename
-            else f"top_commenters_{safe_plat}_{safe_user}_{date_str}.xlsx"
+            else f"{safe_user}_{safe_plat}_{date_str}.xlsx"
         )
         if not default_name or default_name in {".", ".."}:
             raise HTTPException(status_code=400, detail="Nama file export tidak valid")
@@ -543,7 +547,7 @@ def export_results(req: ExportRequest):
             all_comments=req.all_comments,
             scraped_posts=req.scraped_posts,
             summary_stats=req.summary_stats,
-            target_username=safe_user,
+            target_username=raw_user.replace("@", "").strip().strip("/") or safe_user,
             start_date=req.start_date,
             end_date=req.end_date,
             platform=req.platform,
