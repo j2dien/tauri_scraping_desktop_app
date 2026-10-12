@@ -622,6 +622,56 @@ def _media_id(media) -> str:
     return str(value) if value is not None else ""
 
 
+def _web_api_media_comments(cl: Client, media_id: str, amount: int = COMMENTS_PER_POST_LIMIT) -> list[dict]:
+    """Ambil komentar lewat endpoint REST yang dipakai Instagram Web.
+
+    ``media_comments_gql`` instagrapi memakai query_hash lama yang kini ditolak
+    (ClientBadRequestError), sedangkan endpoint ini tetap dipakai UI web dan
+    cukup dengan cookie sesi + header web standar.
+    """
+    media_pk = str(media_id).split("_", 1)[0]
+    headers = {
+        "Accept": "*/*",
+        "Referer": "https://www.instagram.com/",
+        "User-Agent": getattr(cl, "public_user_agent", ""),
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    csrf_token = cl.public.cookies.get("csrftoken")
+    if csrf_token:
+        headers["X-CSRFToken"] = csrf_token
+
+    comments: list[dict] = []
+    seen: set[str] = set()
+    min_id = None
+    timeout = min(int(getattr(cl, "request_timeout", 20) or 20), 20)
+    for _ in range(10):
+        params = {"can_support_threading": "true", "permalink_enabled": "false"}
+        if min_id:
+            params["min_id"] = min_id
+        response = cl.public.get(
+            f"https://www.instagram.com/api/v1/media/{media_pk}/comments/",
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+        if payload.get("status") == "fail":
+            raise RuntimeError(str(payload.get("message") or "web_api comments status=fail"))
+        for comment in payload.get("comments") or []:
+            key = str(comment.get("pk") or comment.get("id") or "")
+            if key and key in seen:
+                continue
+            seen.add(key)
+            comments.append(comment)
+        min_id = payload.get("next_min_id")
+        if not min_id or len(comments) >= amount:
+            break
+        time.sleep(1.0)
+    return comments[:amount]
+
+
 def _media_date(media) -> Optional[datetime]:
     """Normalisasi waktu Instagram menjadi waktu lokal naive untuk filter tanggal UI."""
     taken_at = getattr(media, "taken_at", None)
@@ -2355,6 +2405,10 @@ def get_comments_from_post(
     # Endpoint kosong belum tentu error (post memang dapat tidak memiliki
     # komentar), sehingga fallback dicoba tanpa menghapus diagnostik error.
     comment_methods = []
+    if getattr(cl, "_instagram_web_session", False):
+        comment_methods.append(
+            ("web_api", lambda mid, amount: _web_api_media_comments(cl, mid, amount=amount))
+        )
     if not (
         getattr(cl, "_instagram_web_session", False)
         and source_state.get("graphql_disabled")
@@ -2455,7 +2509,16 @@ def get_comments_from_post(
                 if expected_comments_missing
                 else ""
             )
-            error_detail = "; ".join(comment_errors) or "endpoint mengembalikan data kosong"
+            if comment_errors:
+                error_detail = "; ".join(comment_errors)
+            elif not comment_methods and not should_try_browser:
+                error_detail = (
+                    "tidak ada sumber komentar yang tersisa (nonaktif: "
+                    + (", ".join(disabled_sources) or "-")
+                    + ")"
+                )
+            else:
+                error_detail = "endpoint mengembalikan data kosong"
             raise InstagramCommentFetchError(
                 f"Komentar tidak dapat diverifikasi untuk post {post_code}{count_detail}: "
                 + error_detail
@@ -2770,7 +2833,7 @@ def get_all_comments(
                         total,
                         media,
                         len(all_comments),
-                        f"Post {i+1}/{total} dilewati: komentar tidak dapat diambil ({str(exc)[:160]}).",
+                        f"Post {i+1}/{total} dilewati: komentar tidak dapat diambil ({str(exc)[:400]}).",
                     )
                 continue
             consecutive_comment_failures = 0
