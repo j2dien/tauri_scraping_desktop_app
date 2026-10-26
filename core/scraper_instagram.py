@@ -5,8 +5,13 @@ Mengambil postingan (feed + reels) dan komentar dari profil Instagram
 dalam rentang waktu tertentu secara cepat, aman, dan non-blocking.
 """
 
+import json
+import random
 import re
 import time
+from urllib.parse import urljoin
+
+import requests
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +46,19 @@ LIKER_BROWSER_MIN_INTERVAL_SECONDS = 1.25
 COMMENT_BROWSER_MAX_LOADS = 8
 COMMENT_SOURCE_FAILURE_LIMIT = 3
 INSTAGRAPI_REQUEST_DELAY_SECONDS = 1
+
+# Identitas browser untuk semua request www.instagram.com. Cookie sessionid
+# berasal dari browser desktop, jadi request harus tampak seperti browser yang
+# sama; memakai User-Agent aplikasi iPhone dengan cookie web memicu
+# ``feedback_required`` dan Instagram dapat mengakhiri sesi tersebut.
+WEB_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+WEB_APP_ID = "936619743392459"
+WEB_ASBD_ID = "359341"
+WEB_COOKIE_DOMAIN = ".instagram.com"
+WEB_HTTP_TIMEOUT_SECONDS = 20
 
 
 class LoginRequiredError(Exception):
@@ -135,6 +153,37 @@ def _exception_http_status(exc: BaseException) -> Optional[int]:
     return None
 
 
+def _exception_response_text(exc: BaseException, limit: int = 2000) -> str:
+    """Ambil potongan body respons HTTP.
+
+    Instagram sering membalas HTTP 400 dengan body ``feedback_required`` /
+    ``spam`` saat akun dibatasi, sedangkan teks exception hanya
+    "400 Client Error: Bad Request" sehingga perlu membaca body-nya.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return ""
+    try:
+        return str(getattr(response, "text", "") or "")[:limit]
+    except Exception:
+        return ""
+
+
+def _instagram_reason(exc: BaseException) -> str:
+    """Ambil field ``message`` dari body JSON Instagram, jika ada."""
+    text = _exception_response_text(exc)
+    if not text:
+        return ""
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    parts = [str(body.get(key) or "").strip() for key in ("message", "feedback_title")]
+    return " - ".join(part for part in parts if part)[:150]
+
+
 def _classify_instagram_exception(exc: BaseException) -> str:
     """Klasifikasikan error terminal agar fallback tidak memperparah pembatasan."""
     if isinstance(exc, InstagramRateLimitError):
@@ -143,7 +192,7 @@ def _classify_instagram_exception(exc: BaseException) -> str:
         return "unauthenticated"
 
     status = _exception_http_status(exc)
-    message = f"{type(exc).__name__}: {exc}".lower()
+    message = f"{type(exc).__name__}: {exc} {_exception_response_text(exc)}".lower()
     if status == 429 or any(
         marker in message
         for marker in (
@@ -185,9 +234,12 @@ def _raise_if_terminal_instagram_error(exc: BaseException, action: str) -> None:
     """Hentikan request lanjutan untuk auth/rate-limit; error biasa boleh fallback."""
     category = _classify_instagram_exception(exc)
     if category == "rate_limited":
+        reason = _instagram_reason(exc)
+        reason_text = f" (alasan Instagram: {reason})" if reason else ""
         raise InstagramRateLimitError(
-            f"Instagram membatasi permintaan saat {action}. Pekerjaan dihentikan agar pembatasan tidak bertambah; "
-            "tunggu sebelum mencoba kembali."
+            f"Instagram membatasi permintaan saat {action}{reason_text}. Pekerjaan dihentikan agar pembatasan "
+            "tidak bertambah. Pembatasan bisa berlaku pada akun maupun alamat IP/jaringan: jika akun lain juga "
+            "ditolak, tunggu beberapa jam atau ganti jaringan (mis. hotspot seluler) sebelum mencoba kembali."
         ) from exc
     if category == "unauthenticated":
         raise InstagramAuthenticationError(
@@ -268,17 +320,230 @@ def _session_user_id(sessionid: str) -> str:
     return match.group(1) if match else ""
 
 
+def _set_web_cookie(jar: Any, name: str, value: str) -> None:
+    """Simpan cookie pada domain ``.instagram.com`` tanpa salinan ganda.
+
+    Cookie tanpa domain tidak ikut terhapus saat Instagram mengirim
+    ``Set-Cookie: sessionid=""; expires=1970``, sehingga sesi mati tetap
+    terkirim dan halaman berputar di redirect tanpa akhir.
+    """
+    if isinstance(jar, requests.cookies.RequestsCookieJar):
+        for cookie in list(jar):
+            if cookie.name == name and cookie.domain != WEB_COOKIE_DOMAIN:
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+        jar.set(name, value, domain=WEB_COOKIE_DOMAIN, path="/")
+    else:
+        jar.set(name, value)
+
+
 def _sync_web_cookies(cl: Client) -> None:
     """Salin cookie autentikasi ke session web instagrapi."""
-    for cookie in cl.private.cookies:
-        cl.public.cookies.set(cookie.name, cookie.value)
+    for cookie in list(cl.private.cookies):
+        if cookie.value:
+            _set_web_cookie(cl.public.cookies, cookie.name, cookie.value)
 
     owner_id = (
         str((getattr(cl, "authorization_data", {}) or {}).get("ds_user_id") or "")
         or _session_user_id(getattr(cl, "sessionid", "") or "")
     )
     if owner_id:
-        cl.public.cookies.set("ds_user_id", owner_id)
+        _set_web_cookie(cl.public.cookies, "ds_user_id", owner_id)
+
+
+def _session_ended_error() -> "InstagramAuthenticationError":
+    return InstagramAuthenticationError(
+        "Instagram telah mengakhiri sesi Cookie Session ID ini (sessionid dihapus oleh server). "
+        "Buka Instagram di browser, logout lalu login kembali, salin sessionid terbaru, "
+        "kemudian login ulang di aplikasi."
+    )
+
+
+def _web_get_page(cl: Client, url: str) -> requests.Response:
+    """GET halaman seperti navigasi browser dan deteksi sesi yang diakhiri server."""
+    had_session = bool(cl.public.cookies.get("sessionid"))
+    headers = {
+        "User-Agent": WEB_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    for _ in range(4):
+        response = cl.public.get(
+            url,
+            headers=headers,
+            timeout=WEB_HTTP_TIMEOUT_SECONDS,
+            allow_redirects=False,
+        )
+        if had_session and not cl.public.cookies.get("sessionid"):
+            raise _session_ended_error()
+        if response.status_code not in (301, 302, 303, 307, 308):
+            response.raise_for_status()
+            return response
+        location = response.headers.get("location") or ""
+        if "/accounts/login" in location or "/challenge" in location:
+            raise InstagramAuthenticationError(
+                "Instagram meminta login ulang atau verifikasi (challenge) untuk sesi ini. "
+                "Selesaikan di browser, salin sessionid terbaru, lalu login ulang di aplikasi."
+            )
+        url = urljoin(url, location)
+    raise LoginRequiredError("Instagram terus mengalihkan halaman (redirect berulang).")
+
+
+def _ensure_web_tokens(cl: Client) -> dict:
+    """Muat token halaman (lsd, fb_dtsg) sekali per client, seperti browser."""
+    tokens = getattr(cl, "_instagram_web_tokens", None)
+    if isinstance(tokens, dict):
+        return tokens
+
+    _sync_web_cookies(cl)
+    html = _web_get_page(cl, "https://www.instagram.com/").text or ""
+
+    def find(pattern: str) -> str:
+        match = re.search(pattern, html)
+        return match.group(1) if match else ""
+
+    tokens = {
+        "lsd": find(r'"LSD",\[\],\{"token":"([^"]+)"'),
+        "fb_dtsg": find(r'"DTSGInitialData",\[\],\{"token":"([^"]+)"')
+        or find(r'"dtsg":\{"token":"([^"]+)"'),
+    }
+    setattr(cl, "_instagram_web_tokens", tokens)
+    setattr(cl, "_instagram_web_last_request", time.monotonic())
+    return tokens
+
+
+def _web_xhr_headers(cl: Client, referer: str) -> dict:
+    """Header XHR/fetch Chrome untuk endpoint REST ``/api/v1/`` Instagram Web.
+
+    Tanpa ``Sec-Fetch-*`` Instagram menganggap request Chrome sebagai navigasi
+    dan membalas halaman HTML, bukan JSON.
+    """
+    headers = {
+        "User-Agent": WEB_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        "Referer": referer,
+        "X-IG-App-ID": WEB_APP_ID,
+        "X-ASBD-ID": WEB_ASBD_ID,
+        "X-IG-WWW-Claim": "0",
+        "X-Requested-With": "XMLHttpRequest",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    try:
+        csrf_token = cl.public.cookies.get("csrftoken")
+    except Exception:
+        csrf_token = None
+    if csrf_token:
+        headers["X-CSRFToken"] = csrf_token
+    return headers
+
+
+def _web_pace(cl: Client) -> None:
+    """Jeda acak antar request agar ritmenya menyerupai pengguna biasa."""
+    low, high = (getattr(cl, "delay_range", None) or [1, 2])[:2]
+    wait = random.uniform(float(low), float(high))
+    last = getattr(cl, "_instagram_web_last_request", 0.0)
+    remaining = wait - (time.monotonic() - last)
+    if last and remaining > 0:
+        time.sleep(remaining)
+    setattr(cl, "_instagram_web_last_request", time.monotonic())
+
+
+def _web_graphql_request(
+    cl: Client,
+    doc_id: str,
+    variables: dict,
+    referer: Optional[str] = None,
+    friendly_name: str = "",
+) -> dict:
+    """POST GraphQL doc_id dengan header dan token yang sama seperti Instagram Web."""
+    tokens = _ensure_web_tokens(cl)
+    _web_pace(cl)
+
+    owner_id = str(cl.public.cookies.get("ds_user_id") or "")
+    form = {
+        "av": owner_id or "0",
+        "__d": "www",
+        "__user": "0",
+        "__a": "1",
+        "__comet_req": "7",
+        "fb_api_caller_class": "RelayModern",
+        "variables": json.dumps(variables, separators=(",", ":")),
+        "server_timestamps": "true",
+        "doc_id": doc_id,
+    }
+    if friendly_name:
+        form["fb_api_req_friendly_name"] = friendly_name
+    if tokens.get("lsd"):
+        form["lsd"] = tokens["lsd"]
+    if tokens.get("fb_dtsg"):
+        form["fb_dtsg"] = tokens["fb_dtsg"]
+        form["jazoest"] = "2" + str(sum(ord(ch) for ch in tokens["fb_dtsg"]))
+
+    headers = {
+        "User-Agent": WEB_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www.instagram.com",
+        "Referer": referer or "https://www.instagram.com/",
+        "X-IG-App-ID": WEB_APP_ID,
+        "X-ASBD-ID": WEB_ASBD_ID,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    csrf_token = cl.public.cookies.get("csrftoken")
+    if csrf_token:
+        headers["X-CSRFToken"] = csrf_token
+    if tokens.get("lsd"):
+        headers["X-FB-LSD"] = tokens["lsd"]
+    if friendly_name:
+        headers["X-FB-Friendly-Name"] = friendly_name
+
+    had_session = bool(cl.public.cookies.get("sessionid"))
+    response = cl.public.post(
+        "https://www.instagram.com/graphql/query",
+        data=form,
+        headers=headers,
+        timeout=WEB_HTTP_TIMEOUT_SECONDS,
+        allow_redirects=False,
+    )
+    if had_session and not cl.public.cookies.get("sessionid"):
+        raise _session_ended_error()
+    if 300 <= response.status_code < 400:
+        raise InstagramAuthenticationError(
+            "Instagram mengalihkan request GraphQL ke halaman login. Login ulang dengan sessionid terbaru."
+        )
+    response.raise_for_status()
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise ClientError(
+            "Instagram mengembalikan halaman HTML, bukan data GraphQL (doc_id={}).".format(doc_id)
+        ) from exc
+    if not isinstance(body, dict):
+        raise ClientError("Respons GraphQL Instagram tidak dikenali (doc_id={}).".format(doc_id))
+    if body.get("data") is None:
+        # Pesan seperti feedback_required/login_required ikut dibawa agar
+        # pengklasifikasi error dapat menghentikan pekerjaan dengan benar.
+        errors = body.get("errors") or []
+        first = errors[0] if errors and isinstance(errors[0], dict) else {}
+        detail = (
+            body.get("message")
+            or first.get("summary")
+            or first.get("message")
+            or first.get("description")
+            or "tanpa data"
+        )
+        raise ClientError("GraphQL Instagram gagal (doc_id={}): {}".format(doc_id, str(detail)[:200]))
+    return body["data"]
 
 
 def _configure_web_session(cl: Client, sessionid: str, extra_cookies=None) -> str:
@@ -296,7 +561,13 @@ def _configure_web_session(cl: Client, sessionid: str, extra_cookies=None) -> st
     for name, value in cookies.items():
         if value:
             cl.private.cookies.set(name, str(value))
-            cl.public.cookies.set(name, str(value))
+            _set_web_cookie(cl.public.cookies, name, str(value))
+
+    # Semua request web (GraphQL, komentar, oEmbed, validasi) memakai identitas
+    # browser yang sama dengan asal cookie sessionid.
+    cl.public_user_agent = WEB_USER_AGENT
+    cl.public.headers["User-Agent"] = WEB_USER_AGENT
+    setattr(cl, "_instagram_web_tokens", None)
 
     cl.authorization_data = {
         "ds_user_id": owner_id,
@@ -355,14 +626,9 @@ def _validate_web_session_via_account_form(
     try:
         response = request(
             "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
-            headers={
-                "Accept": "*/*",
-                "Referer": "https://www.instagram.com/accounts/edit/",
-                "User-Agent": getattr(cl, "public_user_agent", ""),
-                "X-IG-App-ID": "936619743392459",
-                "X-Requested-With": "XMLHttpRequest",
-            },
+            headers=_web_xhr_headers(cl, "https://www.instagram.com/accounts/edit/"),
             timeout=min(int(getattr(cl, "request_timeout", 20) or 20), 20),
+            allow_redirects=False,
         )
     except Exception as exc:
         _raise_if_terminal_instagram_error(exc, "memvalidasi Cookie Session ID melalui halaman akun")
@@ -434,7 +700,8 @@ def _validate_web_session(cl: Client, expected_username: str = "") -> bool:
         return account_form_result
 
     # Fallback untuk instalasi/region yang tidak menyediakan web_form_data.
-    data = cl.public_doc_id_graphql_request(
+    data = _web_graphql_request(
+        cl,
         REELS_WEB_DOC_ID,
         {
             "data": {
@@ -444,6 +711,7 @@ def _validate_web_session(cl: Client, expected_username: str = "") -> bool:
             }
         },
         referer="https://www.instagram.com/",
+        friendly_name="PolarisProfileReelsTabContentQuery",
     )
     # Envelope ``xdt_viewer`` juga dikirim untuk pengunjung anonim dengan nilai
     # ``user: null``. Feed/Reels publik tetap dapat dibaca pada kondisi itu,
@@ -589,7 +857,7 @@ def _enrich_reel_captions_oembed(
             response = cl.public.get(
                 "https://www.instagram.com/api/v1/oembed/",
                 params={"url": get_instagram_media_url(reel)},
-                headers={"User-Agent": cl.public_user_agent},
+                headers=_web_xhr_headers(cl, "https://www.instagram.com/"),
                 timeout=min(int(cl.request_timeout or 20), 20),
             )
             response.raise_for_status()
@@ -630,16 +898,7 @@ def _web_api_media_comments(cl: Client, media_id: str, amount: int = COMMENTS_PE
     cukup dengan cookie sesi + header web standar.
     """
     media_pk = str(media_id).split("_", 1)[0]
-    headers = {
-        "Accept": "*/*",
-        "Referer": "https://www.instagram.com/",
-        "User-Agent": getattr(cl, "public_user_agent", ""),
-        "X-IG-App-ID": "936619743392459",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    csrf_token = cl.public.cookies.get("csrftoken")
-    if csrf_token:
-        headers["X-CSRFToken"] = csrf_token
+    headers = _web_xhr_headers(cl, "https://www.instagram.com/")
 
     comments: list[dict] = []
     seen: set[str] = set()
@@ -654,6 +913,7 @@ def _web_api_media_comments(cl: Client, media_id: str, amount: int = COMMENTS_PE
             params=params,
             headers=headers,
             timeout=timeout,
+            allow_redirects=False,
         )
         response.raise_for_status()
         payload = response.json() or {}
@@ -761,6 +1021,7 @@ def _get_reels_gql_in_range(
     collected_ids = set()
     cursor = None
     seen_cursors = set()
+    seen_reel_ids: set = set()
     total_detected = 0
     page = 0
 
@@ -774,12 +1035,14 @@ def _get_reels_gql_in_range(
         if cursor:
             query_data["max_id"] = cursor
 
-        payload = cl.public_doc_id_graphql_request(
+        payload = _web_graphql_request(
+            cl,
             REELS_WEB_DOC_ID,
             {"data": query_data},
             referer=f"https://www.instagram.com/{target_username}/reels/"
             if target_username
             else "https://www.instagram.com/",
+            friendly_name="PolarisProfileReelsTabContentQuery_connection",
         )
         connection = (payload or {}).get("xdt_api__v1__clips__user__connection_v2") or {}
         edges = connection.get("edges") or []
@@ -813,6 +1076,13 @@ def _get_reels_gql_in_range(
         if page_dates and min(page_dates) < start_date:
             break
 
+        page_ids = {_media_id(reel) for reel in extracted} - {""}
+        if page_ids and page_ids <= seen_reel_ids:
+            if progress_callback:
+                progress_callback("Reels: Instagram mengulang halaman yang sama; pagination dihentikan.")
+            break
+        seen_reel_ids |= page_ids
+
         page_info = connection.get("page_info") or {}
         next_cursor = page_info.get("end_cursor")
         if not page_info.get("has_next_page") or not next_cursor or next_cursor in seen_cursors:
@@ -838,23 +1108,28 @@ def _get_profile_web_payload(
 ) -> dict:
     """Ambil profil/feed melalui Polaris web doc_id yang aktif."""
     _sync_web_cookies(cl)
-    query_data = {
-        "count": min(max(int(page_size), 1), 50),
-        "include_relationship_info": True,
-        "latest_besties_reel_media": True,
-        "latest_reel_media": True,
+    count = min(max(int(page_size), 1), 50)
+    variables = {
+        "data": {
+            "count": count,
+            "include_relationship_info": True,
+            "latest_besties_reel_media": True,
+            "latest_reel_media": True,
+        },
+        "username": target_username,
+        "__relay_internal__pv__PolarisFeedShareMenurelayprovider": False,
     }
     if end_cursor:
-        query_data["max_id"] = end_cursor
+        # Pagination Relay memakai ``after``; ``max_id`` di dalam ``data``
+        # diabaikan Instagram sehingga halaman pertama terus berulang.
+        variables.update({"after": end_cursor, "before": None, "first": count, "last": None})
 
-    return cl.public_doc_id_graphql_request(
+    return _web_graphql_request(
+        cl,
         PROFILE_WEB_DOC_ID,
-        {
-            "data": query_data,
-            "username": target_username,
-            "__relay_internal__pv__PolarisFeedShareMenurelayprovider": False,
-        },
+        variables,
         referer=f"https://www.instagram.com/{target_username}/",
+        friendly_name="PolarisProfilePostsQuery",
     )
 
 
@@ -903,6 +1178,7 @@ def _paginate_feed_web_by_date(
     cursor = None
     seen_cursors = set()
     seen_ids = set()
+    seen_page_ids: set = set()
     collected = []
     page = 0
 
@@ -918,9 +1194,13 @@ def _paginate_feed_web_by_date(
 
         page_dates = []
         added = 0
+        page_ids = set()
         for edge in edges:
             node = (edge or {}).get("node") or {}
             candidate = node.get("media") if isinstance(node.get("media"), dict) else node
+            raw_id = str(candidate.get("pk") or candidate.get("id") or candidate.get("code") or "")
+            if raw_id:
+                page_ids.add(raw_id)
             media = None
             for extractor in (extract_media_v1, extract_media_gql):
                 try:
@@ -951,6 +1231,14 @@ def _paginate_feed_web_by_date(
         # seluruh media bertanggal pada halaman sudah lebih lama dari batas.
         if page_dates and max(page_dates) < start_date:
             break
+
+        # Pengaman: jika Instagram mengulang halaman yang sudah dilihat,
+        # hentikan agar tidak mengirim ratusan request sia-sia.
+        if page_ids and page_ids <= seen_page_ids:
+            if progress_callback:
+                progress_callback("Feed: Instagram mengulang halaman yang sama; pagination dihentikan.")
+            break
+        seen_page_ids |= page_ids
 
         page_info = connection.get("page_info") or {}
         next_cursor = page_info.get("end_cursor")
@@ -2409,10 +2697,10 @@ def get_comments_from_post(
         comment_methods.append(
             ("web_api", lambda mid, amount: _web_api_media_comments(cl, mid, amount=amount))
         )
-    if not (
-        getattr(cl, "_instagram_web_session", False)
-        and source_state.get("graphql_disabled")
-    ):
+    # media_comments_gql instagrapi memakai User-Agent aplikasi iPhone dan
+    # query_hash lama; dengan cookie browser kombinasi ini memicu
+    # feedback_required, jadi hanya dipakai untuk sesi non-web.
+    if not getattr(cl, "_instagram_web_session", False):
         comment_methods.append(("graphql", getattr(cl, "media_comments_gql", None)))
     if not getattr(cl, "_instagram_web_session", False):
         comment_methods.append(("private_api", getattr(cl, "media_comments", None)))

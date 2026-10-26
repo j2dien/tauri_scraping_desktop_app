@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -291,6 +292,16 @@ class OEmbedSafetyTests(unittest.TestCase):
 
 
 class SessionIdentityTests(unittest.TestCase):
+    def setUp(self):
+        # Request GraphQL web diarahkan ke stub milik client palsu.
+        patcher = mock.patch.object(
+            scraper,
+            "_web_graphql_request",
+            side_effect=lambda cl, *args, **kwargs: cl.public_doc_id_graphql_request(*args, **kwargs),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     class CookieJar(list):
         def set(self, name, value):
             self[:] = [cookie for cookie in self if cookie.name != name]
@@ -571,10 +582,13 @@ class CommentResultSafetyTests(unittest.TestCase):
             media_comments=lambda *_args, **_kwargs: calls.append("private") or [],
         )
 
-        result = scraper.get_comments_from_post(client, self.media(comment_count=0))
+        web_api = lambda *_args, **_kwargs: calls.append("web_api") or []
+        with patch.object(scraper, "_web_api_media_comments", side_effect=web_api):
+            result = scraper.get_comments_from_post(client, self.media(comment_count=0))
 
         self.assertEqual(result, [])
-        self.assertEqual(calls, ["graphql"])
+        # Sesi browser hanya memakai endpoint web, bukan GraphQL/Private API instagrapi.
+        self.assertEqual(calls, ["web_api"])
 
     def test_web_session_empty_comments_with_positive_metadata_is_reported(self):
         calls = []
@@ -584,17 +598,23 @@ class CommentResultSafetyTests(unittest.TestCase):
             media_comments=lambda *_args, **_kwargs: calls.append("private") or [],
         )
 
-        with self.assertRaises(scraper.InstagramCommentFetchError):
-            scraper.get_comments_from_post(client, self.media(comment_count=3))
+        web_api = lambda *_args, **_kwargs: calls.append("web_api") or []
+        with patch.object(scraper, "_web_api_media_comments", side_effect=web_api):
+            with self.assertRaises(scraper.InstagramCommentFetchError):
+                scraper.get_comments_from_post(client, self.media(comment_count=3))
 
-        self.assertEqual(calls, ["graphql"])
+        self.assertEqual(calls, ["web_api"])
 
-    def test_web_session_uses_browser_comment_fallback_after_graphql_decode_failure(self):
+    def test_web_session_uses_browser_comment_fallback_after_web_api_decode_failure(self):
         calls = []
+
+        def web_api(*_args, **_kwargs):
+            calls.append("web_api")
+            raise RuntimeError("ClientJSONDecodeError")
 
         def gql(*_args, **_kwargs):
             calls.append("graphql")
-            raise RuntimeError("ClientJSONDecodeError")
+            return []
 
         browser = SimpleNamespace(
             lookup_comments=lambda *_args, **_kwargs: scraper.CommentLookupResult(
@@ -618,14 +638,15 @@ class CommentResultSafetyTests(unittest.TestCase):
             media_comments=lambda *_args, **_kwargs: calls.append("private") or [],
         )
 
-        result = scraper.get_comments_from_post(
-            client,
-            self.media(comment_count=1),
-            fetch_likers=False,
-            liker_browser=browser,
-        )
+        with patch.object(scraper, "_web_api_media_comments", side_effect=web_api):
+            result = scraper.get_comments_from_post(
+                client,
+                self.media(comment_count=1),
+                fetch_likers=False,
+                liker_browser=browser,
+            )
 
-        self.assertEqual(calls, ["graphql"])
+        self.assertEqual(calls, ["web_api"])
         self.assertEqual(result[0]["comment_text"], "berhasil dari browser")
         self.assertEqual(client._last_comment_lookup["source"], "browser_web")
 
